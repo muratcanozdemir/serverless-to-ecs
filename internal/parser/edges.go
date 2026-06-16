@@ -1,0 +1,298 @@
+package parser
+
+import (
+	"strings"
+
+	"serverless-to-ecs/internal/model"
+)
+
+// resolveEdges examines a resource's properties for references to other resources
+// and creates typed edges in the graph. Called once per resource in the second pass.
+func resolveEdges(g *model.Graph, logicalID string, res RawResource) {
+	switch res.Type {
+
+	case "AWS::Lambda::EventSourceMapping":
+		resolveEventSourceMapping(g, logicalID, res.Properties)
+
+	case "AWS::ApiGateway::Method":
+		resolveAPIGatewayMethod(g, logicalID, res.Properties)
+
+	case "AWS::ApiGatewayV2::Route":
+		resolveHTTPAPIRoute(g, logicalID, res.Properties)
+
+	case "AWS::Events::Rule":
+		resolveEventBridgeTargets(g, logicalID)
+
+	case "AWS::StepFunctions::StateMachine":
+		resolveStepFunctionTargets(g, logicalID)
+
+	case "AWS::SNS::Subscription":
+		resolveSNSSubscription(g, res.Properties)
+	}
+
+	// For any Lambda, check env vars for table references.
+	if res.Type == "AWS::Lambda::Function" || res.Type == "AWS::Serverless::Function" {
+		resolveLambdaEnvRefs(g, logicalID, res.Properties)
+	}
+}
+
+// resolveEventSourceMapping handles AWS::Lambda::EventSourceMapping.
+// These wire SQS queues (or DynamoDB streams, Kinesis) to Lambda functions.
+func resolveEventSourceMapping(g *model.Graph, _ string, props map[string]interface{}) {
+	fnRef := resolveRef(props["FunctionName"])
+	sourceRef := resolveRef(props["EventSourceArn"])
+
+	if fnRef == "" || sourceRef == "" {
+		return
+	}
+
+	// Determine edge type based on what the source is.
+	if _, ok := g.Queues[sourceRef]; ok {
+		g.AddEdge(sourceRef, fnRef, model.EdgeTriggers, "SQS event source")
+	} else if _, ok := g.Tables[sourceRef]; ok {
+		g.AddEdge(sourceRef, fnRef, model.EdgeTriggers, "DynamoDB stream")
+	} else {
+		// Could be Kinesis or another source we don't model.
+		g.AddEdge(sourceRef, fnRef, model.EdgeTriggers, "event source mapping")
+	}
+}
+
+// resolveAPIGatewayMethod handles REST API methods with Lambda integrations.
+// The integration URI typically references the Lambda function.
+func resolveAPIGatewayMethod(g *model.Graph, _ string, props map[string]interface{}) {
+	// Find the parent REST API.
+	apiRef := resolveRef(props["RestApiId"])
+	method := getString(props, "HttpMethod")
+
+	// Extract the resource path. In CFN this comes from AWS::ApiGateway::Resource,
+	// but for simplicity we use the method's resource reference.
+	resourceRef := resolveRef(props["ResourceId"])
+	path := "/" + resourceRef // approximate — real path requires walking the resource tree
+
+	// Check for Lambda integration.
+	integration, ok := props["Integration"].(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	intType := getString(integration, "Type")
+	if intType != "AWS_PROXY" && intType != "AWS" {
+		return
+	}
+
+	// Integration URI may contain a GetAtt or Sub referencing the Lambda.
+	lambdaRef := extractLambdaFromIntegrationURI(integration["Uri"])
+	if lambdaRef == "" {
+		return
+	}
+
+	if apiRef != "" {
+		g.Routes = append(g.Routes, model.APIRoute{
+			APIID:     apiRef,
+			Path:      path,
+			Method:    method,
+			TargetRef: lambdaRef,
+		})
+	}
+	g.AddEdge(apiRef, lambdaRef, model.EdgeInvokes, method+" "+path)
+}
+
+// resolveHTTPAPIRoute handles HTTP API (v2) routes.
+func resolveHTTPAPIRoute(g *model.Graph, _ string, props map[string]interface{}) {
+	apiRef := resolveRef(props["ApiId"])
+	routeKey := getString(props, "RouteKey") // e.g., "GET /items"
+
+	targetRef := resolveRef(props["Target"])
+	if targetRef == "" {
+		return
+	}
+
+	// Target is usually an integration, not a Lambda directly.
+	// For the graph, we record the route. Edge resolution for HTTP APIs
+	// is less reliable than REST APIs without also reading the Integration resource.
+	if apiRef != "" && routeKey != "" {
+		g.Routes = append(g.Routes, model.APIRoute{
+			APIID:     apiRef,
+			Path:      routeKey,
+			Method:    "",
+			TargetRef: targetRef,
+		})
+	}
+}
+
+// resolveEventBridgeTargets creates edges from EventBridge rules to their targets.
+func resolveEventBridgeTargets(g *model.Graph, logicalID string) {
+	rule, ok := g.Rules[logicalID]
+	if !ok {
+		return
+	}
+	for _, targetRef := range rule.TargetRefs {
+		detail := "event rule"
+		if rule.Schedule != "" {
+			detail = "schedule: " + rule.Schedule
+		}
+		g.AddEdge(logicalID, targetRef, model.EdgeTriggers, detail)
+	}
+}
+
+// resolveStepFunctionTargets creates edges from Step Functions to their task Lambdas.
+func resolveStepFunctionTargets(g *model.Graph, logicalID string) {
+	sf, ok := g.StepFuncs[logicalID]
+	if !ok {
+		return
+	}
+	for _, target := range sf.TaskTargets {
+		g.AddEdge(logicalID, target, model.EdgeOrchestrates, "task state")
+	}
+}
+
+// resolveSNSSubscription handles AWS::SNS::Subscription to find SNS → SQS or SNS → Lambda edges.
+func resolveSNSSubscription(g *model.Graph, props map[string]interface{}) {
+	topicRef := resolveRef(props["TopicArn"])
+	endpointRef := resolveRef(props["Endpoint"])
+	protocol := getString(props, "Protocol")
+
+	if topicRef == "" || endpointRef == "" {
+		return
+	}
+
+	switch protocol {
+	case "lambda":
+		g.AddEdge(topicRef, endpointRef, model.EdgeTriggers, "SNS subscription (lambda)")
+	case "sqs":
+		g.AddEdge(topicRef, endpointRef, model.EdgeSubscribes, "SNS subscription (sqs)")
+	}
+}
+
+// resolveLambdaEnvRefs scans a Lambda's environment variables for references
+// to DynamoDB tables, SQS queues, etc.
+func resolveLambdaEnvRefs(g *model.Graph, logicalID string, props map[string]interface{}) {
+	env, ok := props["Environment"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	vars, ok := env["Variables"].(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	for _, v := range vars {
+		ref := resolveRef(v)
+		if ref == "" {
+			continue
+		}
+		if _, ok := g.Tables[ref]; ok {
+			g.AddEdge(logicalID, ref, model.EdgeReadsWrites, "env var reference")
+		} else if _, ok := g.Queues[ref]; ok {
+			g.AddEdge(logicalID, ref, model.EdgePublishes, "env var reference")
+		} else if _, ok := g.Topics[ref]; ok {
+			g.AddEdge(logicalID, ref, model.EdgePublishes, "env var reference")
+		}
+	}
+}
+
+// extractSAMEvents processes the SAM Events property on a Serverless::Function.
+// SAM Events define triggers inline rather than through separate CFN resources.
+func extractSAMEvents(g *model.Graph, logicalID string, res RawResource) {
+	if res.Type != "AWS::Serverless::Function" {
+		return
+	}
+	events, ok := res.Properties["Events"].(map[string]interface{})
+	if !ok {
+		return
+	}
+
+	for eventName, eventRaw := range events {
+		event, ok := eventRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		eventType := getString(event, "Type")
+		eventProps, _ := event["Properties"].(map[string]interface{})
+
+		switch eventType {
+		case "Api", "HttpApi":
+			path := getString(eventProps, "Path")
+			method := getString(eventProps, "Method")
+			apiRef := resolveRef(eventProps["RestApiId"])
+			if apiRef == "" {
+				apiRef = resolveRef(eventProps["ApiId"])
+			}
+			detail := strings.ToUpper(method) + " " + path
+			if apiRef != "" {
+				g.Routes = append(g.Routes, model.APIRoute{
+					APIID:     apiRef,
+					Path:      path,
+					Method:    strings.ToUpper(method),
+					TargetRef: logicalID,
+				})
+				g.AddEdge(apiRef, logicalID, model.EdgeInvokes, detail)
+			} else {
+				// Implicit API — SAM creates one automatically.
+				g.AddEdge("__implicit_api__", logicalID, model.EdgeInvokes, detail+" (SAM implicit API)")
+			}
+
+		case "SQS":
+			queueRef := resolveRef(eventProps["Queue"])
+			if queueRef != "" {
+				g.AddEdge(queueRef, logicalID, model.EdgeTriggers, "SAM SQS event: "+eventName)
+			}
+
+		case "SNS":
+			topicRef := resolveRef(eventProps["Topic"])
+			if topicRef != "" {
+				g.AddEdge(topicRef, logicalID, model.EdgeTriggers, "SAM SNS event: "+eventName)
+			}
+
+		case "Schedule":
+			schedule := getString(eventProps, "Schedule")
+			detail := "SAM schedule: " + schedule
+			// SAM creates an implicit EventBridge rule. We record the edge
+			// but don't create a Rule model entry since there's no explicit resource.
+			g.AddEdge("__schedule_"+eventName+"__", logicalID, model.EdgeTriggers, detail)
+
+		case "DynamoDB":
+			streamRef := resolveRef(eventProps["Stream"])
+			if streamRef != "" {
+				g.AddEdge(streamRef, logicalID, model.EdgeTriggers, "SAM DynamoDB stream: "+eventName)
+			}
+		}
+	}
+}
+
+// extractLambdaFromIntegrationURI attempts to find a Lambda function reference
+// in an API Gateway integration URI. The URI is typically an intrinsic function
+// like !Sub "arn:aws:apigateway:.../${FnName}/invocations".
+func extractLambdaFromIntegrationURI(uri interface{}) string {
+	// Direct reference.
+	if ref := resolveRef(uri); ref != "" {
+		return ref
+	}
+
+	// Sub expression: look for ${LogicalID} or ${LogicalID.Arn} patterns.
+	if m, ok := uri.(map[string]interface{}); ok {
+		if sub, ok := m["Fn::Sub"].(string); ok {
+			return extractSubRef(sub)
+		}
+	}
+
+	return ""
+}
+
+// extractSubRef finds the first ${...} reference in a Fn::Sub string.
+func extractSubRef(sub string) string {
+	start := strings.Index(sub, "${")
+	if start < 0 {
+		return ""
+	}
+	end := strings.Index(sub[start:], "}")
+	if end < 0 {
+		return ""
+	}
+	ref := sub[start+2 : start+end]
+	// Strip .Arn suffix if present.
+	if dotIdx := strings.Index(ref, "."); dotIdx > 0 {
+		ref = ref[:dotIdx]
+	}
+	return ref
+}

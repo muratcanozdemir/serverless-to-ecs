@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Synthetic e-commerce order processing stack.
+  Exercises all resource types for serverless-to-ecs analysis.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 256
+    Environment:
+      Variables:
+        STAGE: production
+
+Resources:
+
+  # ─── API Layer ────────────────────────────────────────────
+
+  OrderApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: OrderAPI
+      StageName: prod
+      Description: Public-facing order management API
+
+  # ─── Lambda Functions ─────────────────────────────────────
+
+  CreateOrderFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ecommerce-create-order
+      Handler: create_order.handler
+      CodeUri: src/orders/
+      MemorySize: 512
+      Timeout: 10
+      Environment:
+        Variables:
+          ORDER_TABLE: !Ref OrderTable
+          ORDER_QUEUE: !Ref OrderQueue
+      Events:
+        PostOrder:
+          Type: Api
+          Properties:
+            RestApiId: !Ref OrderApi
+            Path: /orders
+            Method: post
+        GetOrder:
+          Type: Api
+          Properties:
+            RestApiId: !Ref OrderApi
+            Path: /orders/{orderId}
+            Method: get
+
+  ProcessOrderFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ecommerce-process-order
+      Handler: process_order.handler
+      CodeUri: src/processing/
+      MemorySize: 256
+      Timeout: 60
+      Environment:
+        Variables:
+          ORDER_TABLE: !Ref OrderTable
+      Events:
+        OrderMessage:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrderQueue.Arn
+            BatchSize: 10
+
+  FulfillOrderFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ecommerce-fulfill-order
+      Handler: fulfill.handler
+      CodeUri: src/fulfillment/
+      MemorySize: 128
+      Timeout: 90
+      Environment:
+        Variables:
+          ORDER_TABLE: !Ref OrderTable
+
+  NotifyCustomerFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ecommerce-notify-customer
+      Handler: notify.handler
+      CodeUri: src/notifications/
+      MemorySize: 128
+      Timeout: 15
+      Environment:
+        Variables:
+          NOTIFICATION_TOPIC: !Ref NotificationTopic
+
+  DailyReportFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ecommerce-daily-report
+      Handler: daily_report.handler
+      CodeUri: src/reporting/
+      MemorySize: 1024
+      Timeout: 300
+      Environment:
+        Variables:
+          ORDER_TABLE: !Ref OrderTable
+      Events:
+        DailyCron:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 6 * * ? *)
+            Description: Generate daily order summary at 06:00 UTC
+
+  InventoryCheckerFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ecommerce-inventory-check
+      Handler: inventory.handler
+      CodeUri: src/inventory/
+      MemorySize: 256
+      Timeout: 30
+
+  # ─── Step Functions ───────────────────────────────────────
+
+  OrderWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: ecommerce-order-workflow
+      Definition:
+        Comment: Order fulfillment workflow with inventory check and notification
+        StartAt: CheckInventory
+        States:
+          CheckInventory:
+            Type: Task
+            Resource: !GetAtt InventoryCheckerFn.Arn
+            Next: InventoryDecision
+            Retry:
+              - ErrorEquals: ["States.TaskFailed"]
+                IntervalSeconds: 2
+                MaxAttempts: 3
+          InventoryDecision:
+            Type: Choice
+            Choices:
+              - Variable: "$.inventoryAvailable"
+                BooleanEquals: true
+                Next: FulfillOrder
+              - Variable: "$.inventoryAvailable"
+                BooleanEquals: false
+                Next: NotifyOutOfStock
+          FulfillOrder:
+            Type: Task
+            Resource: !GetAtt FulfillOrderFn.Arn
+            Next: NotifySuccess
+          NotifySuccess:
+            Type: Task
+            Resource: !GetAtt NotifyCustomerFn.Arn
+            End: true
+          NotifyOutOfStock:
+            Type: Task
+            Resource: !GetAtt NotifyCustomerFn.Arn
+            End: true
+
+  # ─── EventBridge ──────────────────────────────────────────
+
+  StaleOrderCleanupRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ecommerce-stale-order-cleanup
+      Description: Clean up stale pending orders every 4 hours
+      ScheduleExpression: rate(4 hours)
+      Targets:
+        - Id: cleanup-target
+          Arn: !GetAtt ProcessOrderFn.Arn
+
+  # ─── SQS ──────────────────────────────────────────────────
+
+  OrderQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ecommerce-order-queue
+      VisibilityTimeout: 120
+      MessageRetentionPeriod: 1209600
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderDLQ.Arn
+        maxReceiveCount: 3
+
+  OrderDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ecommerce-order-dlq
+      MessageRetentionPeriod: 1209600
+
+  # ─── SNS ──────────────────────────────────────────────────
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ecommerce-notifications
+
+  OrderEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ecommerce-order-events
+
+  # SNS → SQS subscription (fan-out pattern)
+  OrderEventsToQueue:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sqs
+      TopicArn: !Ref OrderEventsTopic
+      Endpoint: !GetAtt OrderQueue.Arn
+
+  # ─── DynamoDB ─────────────────────────────────────────────
+
+  OrderTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ecommerce-orders
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+        - AttributeName: createdAt
+          KeyType: RANGE
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+        - AttributeName: customerId
+          AttributeType: S
+      GlobalSecondaryIndexes:
+        - IndexName: customer-index
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # ─── Supporting Resources (not modeled, but should be detected) ───
+
+  OrderAssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: ecommerce-order-assets
+
+  CreateOrderFnLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${CreateOrderFn}"
+      RetentionInDays: 14
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: ecommerce-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${OrderApi}.execute-api.${AWS::Region}.amazonaws.com/prod"
+  OrderTableName:
+    Description: DynamoDB table name
+    Value: !Ref OrderTable

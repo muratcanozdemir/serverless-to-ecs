@@ -1,0 +1,104 @@
+{
+  "_meta": {
+    "default_region": "eu-central-1",
+    "currency": "USD",
+    "last_verified": "2026-06-16",
+    "sources": [
+      "https://aws.amazon.com/lambda/pricing/",
+      "https://aws.amazon.com/fargate/pricing/",
+      "https://aws.amazon.com/api-gateway/pricing/",
+      "https://aws.amazon.com/step-functions/pricing/",
+      "https://aws.amazon.com/sqs/pricing/",
+      "https://aws.amazon.com/sns/pricing/",
+      "https://aws.amazon.com/eventbridge/pricing/",
+      "https://aws.amazon.com/dynamodb/pricing/"
+    ],
+    "notes": "Lambda compute/request rates are uniform across US and EU regions. API Gateway and Fargate carry a ~14-15% Frankfurt premium. SQS/SNS/EventBridge/StepFunctions rates are effectively uniform. DynamoDB on-demand rates are the same across major regions. Free tier is excluded from estimates — assumes production workload past free tier."
+  },
+  "regions": {
+    "eu-central-1": {
+      "lambda": {
+        "request_per_million": 0.20,
+        "gb_second_x86": 0.0000166667,
+        "gb_second_arm": 0.0000133334
+      },
+      "api_gateway": {
+        "rest_per_million": 3.99,
+        "http_per_million": 1.14
+      },
+      "step_functions": {
+        "standard_per_1k_transitions": 0.025,
+        "express_gb_second": 0.0000166667
+      },
+      "eventbridge": {
+        "custom_per_million": 1.00,
+        "scheduled_per_million": 0.00
+      },
+      "sqs": {
+        "standard_per_million": 0.40,
+        "fifo_per_million": 0.50
+      },
+      "sns": {
+        "publish_per_million": 0.50
+      },
+      "dynamodb": {
+        "on_demand_rru_per_million": 1.25,
+        "on_demand_wru_per_million": 1.25,
+        "provisioned_rcu_per_month": 0.00013,
+        "provisioned_wcu_per_month": 0.00065
+      },
+      "fargate": {
+        "linux_x86_vcpu_per_hour": 0.04656,
+        "linux_x86_gb_per_hour": 0.00511,
+        "linux_arm_vcpu_per_hour": 0.03725,
+        "linux_arm_gb_per_hour": 0.00409
+      },
+      "alb": {
+        "per_hour": 0.0252,
+        "lcu_per_hour": 0.008
+      }
+    },
+    "us-east-1": {
+      "lambda": {
+        "request_per_million": 0.20,
+        "gb_second_x86": 0.0000166667,
+        "gb_second_arm": 0.0000133334
+      },
+      "api_gateway": {
+        "rest_per_million": 3.50,
+        "http_per_million": 1.00
+      },
+      "step_functions": {
+        "standard_per_1k_transitions": 0.025,
+        "express_gb_second": 0.0000166667
+      },
+      "eventbridge": {
+        "custom_per_million": 1.00,
+        "scheduled_per_million": 0.00
+      },
+      "sqs": {
+        "standard_per_million": 0.40,
+        "fifo_per_million": 0.50
+      },
+      "sns": {
+        "publish_per_million": 0.50
+      },
+      "dynamodb": {
+        "on_demand_rru_per_million": 1.25,
+        "on_demand_wru_per_million": 1.25,
+        "provisioned_rcu_per_month": 0.00013,
+        "provisioned_wcu_per_month": 0.00065
+      },
+      "fargate": {
+        "linux_x86_vcpu_per_hour": 0.04048,
+        "linux_x86_gb_per_hour": 0.004445,
+        "linux_arm_vcpu_per_hour": 0.03238,
+        "linux_arm_gb_per_hour": 0.00356
+      },
+      "alb": {
+        "per_hour": 0.0225,
+        "lcu_per_hour": 0.008
+      }
+    }
+  }
+}
