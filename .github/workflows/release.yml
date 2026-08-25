@@ -44,7 +44,7 @@ jobs:
           go build -trimpath -ldflags "-s -w -X serverless-to-ecs/cmd.Version=${{ github.ref_name }}" -o "$out" .
           shasum -a 256 "$out" > "$out.sha256"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: build-${{ matrix.goos }}-${{ matrix.goarch }}
           path: |
