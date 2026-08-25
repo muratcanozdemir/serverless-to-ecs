@@ -226,6 +226,105 @@ func TestEstimateCosts_EndToEnd(t *testing.T) {
 	}
 }
 
+func TestS3Cost(t *testing.T) {
+	p := testPrices(t)
+	if got := s3Cost(nil, p); got != 0 {
+		t.Errorf("s3Cost(nil, ...) = %v, want 0", got)
+	}
+	u := &S3Usage{StorageGB: 100, MonthlyPuts: 10_000, MonthlyGets: 50_000}
+	got := s3Cost(u, p)
+	want := 100*p.S3.StandardStoragePerGBMonth +
+		10_000.0/1000.0*p.S3.PutRequestsPerThousand +
+		50_000.0/1000.0*p.S3.GetRequestsPerThousand
+	if got != want {
+		t.Errorf("s3Cost = %v, want %v", got, want)
+	}
+}
+
+func TestKinesisCost(t *testing.T) {
+	p := testPrices(t)
+	if got := kinesisCost(&model.KinesisStream{ShardCount: 2}, nil, p); got != 0 {
+		t.Errorf("kinesisCost(..., nil, ...) = %v, want 0", got)
+	}
+	stream := &model.KinesisStream{ShardCount: 2}
+	u := &KinesisUsage{MonthlyPutRecords: 2_000_000}
+	got := kinesisCost(stream, u, p)
+	want := 2*p.Kinesis.ShardPerHour*730.0 + 2_000_000.0/1_000_000.0*p.Kinesis.PutPayloadUnitPerMillion
+	if got != want {
+		t.Errorf("kinesisCost = %v, want %v", got, want)
+	}
+}
+
+func TestKinesisCost_ZeroShardCountTreatedAsOne(t *testing.T) {
+	p := testPrices(t)
+	stream := &model.KinesisStream{ShardCount: 0}
+	u := &KinesisUsage{MonthlyPutRecords: 0}
+	got := kinesisCost(stream, u, p)
+	want := 1 * p.Kinesis.ShardPerHour * 730.0
+	if got != want {
+		t.Errorf("kinesisCost with ShardCount=0 = %v, want %v (treated as 1 shard)", got, want)
+	}
+}
+
+func TestEFSCost(t *testing.T) {
+	p := testPrices(t)
+	if got := efsCost(nil, p); got != 0 {
+		t.Errorf("efsCost(nil, ...) = %v, want 0", got)
+	}
+	got := efsCost(&EFSUsage{StorageGB: 40}, p)
+	want := 40 * p.EFS.StandardStoragePerGBMonth
+	if got != want {
+		t.Errorf("efsCost = %v, want %v", got, want)
+	}
+}
+
+func TestSecretCost(t *testing.T) {
+	p := testPrices(t)
+	if got := secretCost(nil, p); got != 0 {
+		t.Errorf("secretCost(nil, ...) = %v, want 0", got)
+	}
+	got := secretCost(&SecretUsage{MonthlyAPICalls: 20_000}, p)
+	want := p.SecretsManager.PerSecretPerMonth + 20_000.0/10_000.0*p.SecretsManager.APICallsPerTenThousand
+	if got != want {
+		t.Errorf("secretCost = %v, want %v", got, want)
+	}
+}
+
+func TestEstimateCosts_NewResourceTypesAreRetainedPostMigration(t *testing.T) {
+	p := testPrices(t)
+	g := model.NewGraph()
+	g.Buckets["Bucket"] = &model.S3Bucket{LogicalID: "Bucket", BucketName: "bucket"}
+	g.Streams["Stream"] = &model.KinesisStream{LogicalID: "Stream", StreamName: "stream", ShardCount: 1}
+	g.FileSystems["FS"] = &model.EFSFileSystem{LogicalID: "FS"}
+	g.Secrets["Secret"] = &model.SecretsManagerSecret{LogicalID: "Secret", Name: "secret"}
+
+	usage := DefaultProfile(g)
+	est := EstimateCosts(g, usage, p, "eu-central-1")
+
+	if len(est.Serverless.S3) != 1 || est.Serverless.S3[0].Total <= 0 {
+		t.Errorf("expected 1 priced S3 line item, got %+v", est.Serverless.S3)
+	}
+	if len(est.Serverless.Kinesis) != 1 || est.Serverless.Kinesis[0].Total <= 0 {
+		t.Errorf("expected 1 priced Kinesis line item, got %+v", est.Serverless.Kinesis)
+	}
+	if len(est.Serverless.EFS) != 1 || est.Serverless.EFS[0].Total <= 0 {
+		t.Errorf("expected 1 priced EFS line item, got %+v", est.Serverless.EFS)
+	}
+	if len(est.Serverless.SecretsManager) != 1 || est.Serverless.SecretsManager[0].Total <= 0 {
+		t.Errorf("expected 1 priced Secrets Manager line item, got %+v", est.Serverless.SecretsManager)
+	}
+
+	// Same four resources should carry the identical cost into ECS.Retained,
+	// since none of them are replaced by the migration.
+	wantRetained := s3Cost(usage.Buckets["Bucket"], p) +
+		kinesisCost(g.Streams["Stream"], usage.Streams["Stream"], p) +
+		efsCost(usage.FileSystems["FS"], p) +
+		secretCost(usage.Secrets["Secret"], p)
+	if est.ECS.Retained != wantRetained {
+		t.Errorf("ECS.Retained = %v, want %v", est.ECS.Retained, wantRetained)
+	}
+}
+
 func TestEstimateCosts_ZeroServerlessTotalAvoidsDivideByZero(t *testing.T) {
 	p := testPrices(t)
 	g := model.NewGraph() // empty graph — nothing to cost

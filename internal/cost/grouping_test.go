@@ -79,6 +79,36 @@ func TestGroupServices_QueueProcessor(t *testing.T) {
 	}
 }
 
+func TestGroupServices_KinesisConsumer(t *testing.T) {
+	g := model.NewGraph()
+	g.Streams["Stream"] = &model.KinesisStream{LogicalID: "Stream", ShardCount: 1}
+	g.Lambdas["Fn"] = &model.Lambda{LogicalID: "Fn", FunctionName: "fn"}
+	g.AddEdge("Stream", "Fn", model.EdgeTriggers, "Kinesis stream")
+
+	groups := GroupServices(g)
+	if len(groups) != 1 || groups[0].Type != "queue-processor" {
+		t.Fatalf("expected one queue-processor-type group for a Kinesis consumer, got %+v", groups)
+	}
+	if len(groups[0].LambdaIDs) != 1 || groups[0].LambdaIDs[0] != "Fn" {
+		t.Errorf("expected Fn in the Kinesis consumer group, got %v", groups[0].LambdaIDs)
+	}
+}
+
+func TestGroupServices_S3EventProcessor(t *testing.T) {
+	g := model.NewGraph()
+	g.Buckets["Bucket"] = &model.S3Bucket{LogicalID: "Bucket", BucketName: "bucket"}
+	g.Lambdas["Fn"] = &model.Lambda{LogicalID: "Fn", FunctionName: "fn"}
+	g.AddEdge("Bucket", "Fn", model.EdgeTriggers, "S3 notification: s3:ObjectCreated:*")
+
+	groups := GroupServices(g)
+	if len(groups) != 1 || groups[0].Type != "queue-processor" {
+		t.Fatalf("expected one queue-processor-type group for an S3 event processor, got %+v", groups)
+	}
+	if len(groups[0].LambdaIDs) != 1 || groups[0].LambdaIDs[0] != "Fn" {
+		t.Errorf("expected Fn in the S3 event processor group, got %v", groups[0].LambdaIDs)
+	}
+}
+
 func TestGroupServices_Scheduled(t *testing.T) {
 	g := model.NewGraph()
 	g.Rules["Rule"] = &model.EventBridgeRule{LogicalID: "Rule", Schedule: "rate(1 hour)"}

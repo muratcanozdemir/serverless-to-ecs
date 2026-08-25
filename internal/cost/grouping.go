@@ -74,16 +74,7 @@ func GroupServices(g *model.Graph) []ServiceGroup {
 
 	// 2. Queue processors: Lambdas triggered by SQS.
 	for _, queueID := range sortedKeys(g.Queues) {
-		var members []string
-		for _, edge := range g.Edges {
-			if edge.From == queueID && edge.Type == model.EdgeTriggers && !assigned[edge.To] {
-				if _, ok := g.Lambdas[edge.To]; ok {
-					members = append(members, edge.To)
-					assigned[edge.To] = true
-				}
-			}
-		}
-		if len(members) > 0 {
+		if members := triggeredMembers(g, queueID, assigned); len(members) > 0 {
 			groups = append(groups, ServiceGroup{
 				Name:      sanitizeName(queueID) + "-processor",
 				Type:      "queue-processor",
@@ -95,21 +86,38 @@ func GroupServices(g *model.Graph) []ServiceGroup {
 
 	// SNS-triggered Lambdas.
 	for _, topicID := range sortedKeys(g.Topics) {
-		var members []string
-		for _, edge := range g.Edges {
-			if edge.From == topicID && edge.Type == model.EdgeTriggers && !assigned[edge.To] {
-				if _, ok := g.Lambdas[edge.To]; ok {
-					members = append(members, edge.To)
-					assigned[edge.To] = true
-				}
-			}
-		}
-		if len(members) > 0 {
+		if members := triggeredMembers(g, topicID, assigned); len(members) > 0 {
 			groups = append(groups, ServiceGroup{
 				Name:      sanitizeName(topicID) + "-subscriber",
 				Type:      "queue-processor",
 				LambdaIDs: dedup(members),
 				Reason:    "SNS trigger: " + topicID,
+			})
+		}
+	}
+
+	// Kinesis-triggered Lambdas. Grouped the same way as SQS: a stream
+	// consumer is architecturally the same shape as a queue processor — a
+	// long-running container polling/consuming a stream of events.
+	for _, streamID := range sortedKeys(g.Streams) {
+		if members := triggeredMembers(g, streamID, assigned); len(members) > 0 {
+			groups = append(groups, ServiceGroup{
+				Name:      sanitizeName(streamID) + "-consumer",
+				Type:      "queue-processor",
+				LambdaIDs: dedup(members),
+				Reason:    "Kinesis trigger: " + streamID,
+			})
+		}
+	}
+
+	// S3-triggered Lambdas.
+	for _, bucketID := range sortedKeys(g.Buckets) {
+		if members := triggeredMembers(g, bucketID, assigned); len(members) > 0 {
+			groups = append(groups, ServiceGroup{
+				Name:      sanitizeName(bucketID) + "-processor",
+				Type:      "queue-processor",
+				LambdaIDs: dedup(members),
+				Reason:    "S3 event trigger: " + bucketID,
 			})
 		}
 	}
@@ -235,6 +243,22 @@ func sanitizeName(s string) string {
 		".", "-",
 	).Replace(s)
 	return s
+}
+
+// triggeredMembers finds Lambdas triggered by sourceID (via an EdgeTriggers
+// edge) that haven't already been assigned to a group, marking each as
+// assigned as it's found.
+func triggeredMembers(g *model.Graph, sourceID string, assigned map[string]bool) []string {
+	var members []string
+	for _, edge := range g.Edges {
+		if edge.From == sourceID && edge.Type == model.EdgeTriggers && !assigned[edge.To] {
+			if _, ok := g.Lambdas[edge.To]; ok {
+				members = append(members, edge.To)
+				assigned[edge.To] = true
+			}
+		}
+	}
+	return members
 }
 
 // sortedKeys returns a map's keys in sorted order, so callers get a

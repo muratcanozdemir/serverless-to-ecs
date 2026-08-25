@@ -14,13 +14,17 @@ import (
 
 // UsageProfile holds estimated monthly usage for every resource in the graph.
 type UsageProfile struct {
-	Lambdas   map[string]*LambdaUsage    `json:"lambdas"`
-	APIs      map[string]*APIUsage       `json:"api_gateways"`
-	StepFuncs map[string]*StepFuncUsage  `json:"step_functions"`
-	Rules     map[string]*EventRuleUsage `json:"eventbridge_rules"`
-	Queues    map[string]*SQSUsage       `json:"sqs_queues"`
-	Topics    map[string]*SNSUsage       `json:"sns_topics"`
-	Tables    map[string]*DynamoDBUsage  `json:"dynamodb_tables"`
+	Lambdas     map[string]*LambdaUsage    `json:"lambdas"`
+	APIs        map[string]*APIUsage       `json:"api_gateways"`
+	StepFuncs   map[string]*StepFuncUsage  `json:"step_functions"`
+	Rules       map[string]*EventRuleUsage `json:"eventbridge_rules"`
+	Queues      map[string]*SQSUsage       `json:"sqs_queues"`
+	Topics      map[string]*SNSUsage       `json:"sns_topics"`
+	Tables      map[string]*DynamoDBUsage  `json:"dynamodb_tables"`
+	Buckets     map[string]*S3Usage        `json:"s3_buckets"`
+	Streams     map[string]*KinesisUsage   `json:"kinesis_streams"`
+	FileSystems map[string]*EFSUsage       `json:"efs_filesystems"`
+	Secrets     map[string]*SecretUsage    `json:"secrets"`
 }
 
 type LambdaUsage struct {
@@ -61,17 +65,43 @@ type DynamoDBUsage struct {
 	Source            string `json:"source"`
 }
 
+type S3Usage struct {
+	StorageGB   float64 `json:"storage_gb"`
+	MonthlyPuts int     `json:"monthly_puts"`
+	MonthlyGets int     `json:"monthly_gets"`
+	Source      string  `json:"source"`
+}
+
+type KinesisUsage struct {
+	MonthlyPutRecords int    `json:"monthly_put_records"`
+	Source            string `json:"source"`
+}
+
+type EFSUsage struct {
+	StorageGB float64 `json:"storage_gb"`
+	Source    string  `json:"source"`
+}
+
+type SecretUsage struct {
+	MonthlyAPICalls int    `json:"monthly_api_calls"`
+	Source          string `json:"source"`
+}
+
 // DefaultProfile generates usage estimates from the resource graph topology.
 // These are heuristic-based: good enough for ±30% ballpark, not for budgeting.
 func DefaultProfile(g *model.Graph) *UsageProfile {
 	p := &UsageProfile{
-		Lambdas:   make(map[string]*LambdaUsage),
-		APIs:      make(map[string]*APIUsage),
-		StepFuncs: make(map[string]*StepFuncUsage),
-		Rules:     make(map[string]*EventRuleUsage),
-		Queues:    make(map[string]*SQSUsage),
-		Topics:    make(map[string]*SNSUsage),
-		Tables:    make(map[string]*DynamoDBUsage),
+		Lambdas:     make(map[string]*LambdaUsage),
+		APIs:        make(map[string]*APIUsage),
+		StepFuncs:   make(map[string]*StepFuncUsage),
+		Rules:       make(map[string]*EventRuleUsage),
+		Queues:      make(map[string]*SQSUsage),
+		Topics:      make(map[string]*SNSUsage),
+		Tables:      make(map[string]*DynamoDBUsage),
+		Buckets:     make(map[string]*S3Usage),
+		Streams:     make(map[string]*KinesisUsage),
+		FileSystems: make(map[string]*EFSUsage),
+		Secrets:     make(map[string]*SecretUsage),
 	}
 
 	// API Gateways: estimate request volume from route count.
@@ -119,6 +149,42 @@ func DefaultProfile(g *model.Graph) *UsageProfile {
 	// DynamoDB tables.
 	for id, table := range g.Tables {
 		p.Tables[id] = defaultDynamoUsage(table)
+	}
+
+	// S3 buckets: flat moderate-traffic default (storage is highly
+	// workload-specific and impossible to infer from the template alone).
+	for id := range g.Buckets {
+		p.Buckets[id] = &S3Usage{
+			StorageGB:   50,
+			MonthlyPuts: 20_000,
+			MonthlyGets: 100_000,
+			Source:      "default",
+		}
+	}
+
+	// Kinesis streams: PUT volume scaled by shard count. 1M records/shard/month
+	// is a moderate baseline — well under a shard's max throughput (1,000
+	// records/sec, or ~2.6B/month), consistent with the "moderate low-traffic
+	// default" heuristics used for the other trigger sources above.
+	for id, stream := range g.Streams {
+		shards := stream.ShardCount
+		if shards < 1 {
+			shards = 1
+		}
+		p.Streams[id] = &KinesisUsage{
+			MonthlyPutRecords: shards * 1_000_000,
+			Source:            "default",
+		}
+	}
+
+	// EFS file systems.
+	for id := range g.FileSystems {
+		p.FileSystems[id] = &EFSUsage{StorageGB: 20, Source: "default"}
+	}
+
+	// Secrets Manager secrets.
+	for id := range g.Secrets {
+		p.Secrets[id] = &SecretUsage{MonthlyAPICalls: 10_000, Source: "default"}
 	}
 
 	// Lambdas: derive from trigger sources.
@@ -184,6 +250,38 @@ func (p *UsageProfile) LoadSidecar(path string) error {
 			if u.MonthlyWriteUnits > 0 {
 				existing.MonthlyWriteUnits = u.MonthlyWriteUnits
 			}
+			existing.Source = "sidecar"
+		}
+	}
+	for id, u := range override.Buckets {
+		if existing, ok := p.Buckets[id]; ok {
+			if u.StorageGB > 0 {
+				existing.StorageGB = u.StorageGB
+			}
+			if u.MonthlyPuts > 0 {
+				existing.MonthlyPuts = u.MonthlyPuts
+			}
+			if u.MonthlyGets > 0 {
+				existing.MonthlyGets = u.MonthlyGets
+			}
+			existing.Source = "sidecar"
+		}
+	}
+	for id, u := range override.Streams {
+		if existing, ok := p.Streams[id]; ok && u.MonthlyPutRecords > 0 {
+			existing.MonthlyPutRecords = u.MonthlyPutRecords
+			existing.Source = "sidecar"
+		}
+	}
+	for id, u := range override.FileSystems {
+		if existing, ok := p.FileSystems[id]; ok && u.StorageGB > 0 {
+			existing.StorageGB = u.StorageGB
+			existing.Source = "sidecar"
+		}
+	}
+	for id, u := range override.Secrets {
+		if existing, ok := p.Secrets[id]; ok && u.MonthlyAPICalls > 0 {
+			existing.MonthlyAPICalls = u.MonthlyAPICalls
 			existing.Source = "sidecar"
 		}
 	}

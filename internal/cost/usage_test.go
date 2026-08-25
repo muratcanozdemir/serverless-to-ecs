@@ -163,6 +163,69 @@ func TestDefaultProfile(t *testing.T) {
 	}
 }
 
+func TestDefaultProfile_NewResourceTypes(t *testing.T) {
+	g := model.NewGraph()
+	g.Buckets["Bucket"] = &model.S3Bucket{LogicalID: "Bucket", BucketName: "bucket"}
+	g.Streams["Stream1Shard"] = &model.KinesisStream{LogicalID: "Stream1Shard", ShardCount: 1}
+	g.Streams["Stream3Shard"] = &model.KinesisStream{LogicalID: "Stream3Shard", ShardCount: 3}
+	g.FileSystems["FS"] = &model.EFSFileSystem{LogicalID: "FS"}
+	g.Secrets["Secret"] = &model.SecretsManagerSecret{LogicalID: "Secret", Name: "secret"}
+
+	p := DefaultProfile(g)
+
+	if p.Buckets["Bucket"] == nil || p.Buckets["Bucket"].StorageGB <= 0 {
+		t.Error("expected a default S3 usage entry with positive storage")
+	}
+	if p.Streams["Stream1Shard"].MonthlyPutRecords != 1_000_000 {
+		t.Errorf("1-shard stream: MonthlyPutRecords = %d, want 1000000", p.Streams["Stream1Shard"].MonthlyPutRecords)
+	}
+	if p.Streams["Stream3Shard"].MonthlyPutRecords != 3_000_000 {
+		t.Errorf("3-shard stream: MonthlyPutRecords = %d, want 3000000 (scaled by shard count)", p.Streams["Stream3Shard"].MonthlyPutRecords)
+	}
+	if p.FileSystems["FS"] == nil || p.FileSystems["FS"].StorageGB <= 0 {
+		t.Error("expected a default EFS usage entry with positive storage")
+	}
+	if p.Secrets["Secret"] == nil || p.Secrets["Secret"].MonthlyAPICalls <= 0 {
+		t.Error("expected a default Secrets Manager usage entry with positive API calls")
+	}
+}
+
+func TestLoadSidecar_NewResourceTypes(t *testing.T) {
+	g := model.NewGraph()
+	g.Buckets["Bucket"] = &model.S3Bucket{LogicalID: "Bucket"}
+	g.Streams["Stream"] = &model.KinesisStream{LogicalID: "Stream", ShardCount: 1}
+	g.FileSystems["FS"] = &model.EFSFileSystem{LogicalID: "FS"}
+	g.Secrets["Secret"] = &model.SecretsManagerSecret{LogicalID: "Secret"}
+	p := DefaultProfile(g)
+
+	sidecar := `{
+		"s3_buckets": {"Bucket": {"storage_gb": 500, "monthly_puts": 1, "monthly_gets": 1}},
+		"kinesis_streams": {"Stream": {"monthly_put_records": 999999}},
+		"efs_filesystems": {"FS": {"storage_gb": 250}},
+		"secrets": {"Secret": {"monthly_api_calls": 55555}}
+	}`
+	path := filepath.Join(t.TempDir(), "usage.json")
+	if err := os.WriteFile(path, []byte(sidecar), 0644); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+	if err := p.LoadSidecar(path); err != nil {
+		t.Fatalf("LoadSidecar: %v", err)
+	}
+
+	if p.Buckets["Bucket"].StorageGB != 500 || p.Buckets["Bucket"].Source != "sidecar" {
+		t.Errorf("Bucket usage not overridden: %+v", p.Buckets["Bucket"])
+	}
+	if p.Streams["Stream"].MonthlyPutRecords != 999999 || p.Streams["Stream"].Source != "sidecar" {
+		t.Errorf("Stream usage not overridden: %+v", p.Streams["Stream"])
+	}
+	if p.FileSystems["FS"].StorageGB != 250 || p.FileSystems["FS"].Source != "sidecar" {
+		t.Errorf("FileSystem usage not overridden: %+v", p.FileSystems["FS"])
+	}
+	if p.Secrets["Secret"].MonthlyAPICalls != 55555 || p.Secrets["Secret"].Source != "sidecar" {
+		t.Errorf("Secret usage not overridden: %+v", p.Secrets["Secret"])
+	}
+}
+
 func TestDefaultProfile_UntriggeredLambdaFallsBackToDefault(t *testing.T) {
 	g := model.NewGraph()
 	g.Lambdas["Orphan"] = &model.Lambda{LogicalID: "Orphan", FunctionName: "orphan", MemoryMB: 128, TimeoutSec: 5}

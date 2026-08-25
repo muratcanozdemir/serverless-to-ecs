@@ -56,6 +56,31 @@ func TestForRegion(t *testing.T) {
 	})
 }
 
+func TestForRegion_S3KinesisEFSSecretsManagerPricingPresent(t *testing.T) {
+	db, err := LoadPricing()
+	if err != nil {
+		t.Fatalf("LoadPricing: %v", err)
+	}
+	for _, region := range []string{"eu-central-1", "us-east-1"} {
+		p, err := db.ForRegion(region)
+		if err != nil {
+			t.Fatalf("ForRegion(%q): %v", region, err)
+		}
+		if p.S3.StandardStoragePerGBMonth <= 0 {
+			t.Errorf("%s: expected positive S3 storage price", region)
+		}
+		if p.Kinesis.ShardPerHour <= 0 {
+			t.Errorf("%s: expected positive Kinesis shard-hour price", region)
+		}
+		if p.EFS.StandardStoragePerGBMonth <= 0 {
+			t.Errorf("%s: expected positive EFS storage price", region)
+		}
+		if p.SecretsManager.PerSecretPerMonth <= 0 {
+			t.Errorf("%s: expected positive Secrets Manager per-secret price", region)
+		}
+	}
+}
+
 func TestRegionList(t *testing.T) {
 	db, err := LoadPricing()
 	if err != nil {

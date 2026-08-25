@@ -19,14 +19,18 @@ type Estimate struct {
 
 // ServerlessCost is the itemized current monthly spend.
 type ServerlessCost struct {
-	Lambda        []LambdaCost `json:"lambda"`
-	APIGateway    []ItemCost   `json:"api_gateway"`
-	StepFunctions []ItemCost   `json:"step_functions"`
-	EventBridge   []ItemCost   `json:"eventbridge"`
-	SQS           []ItemCost   `json:"sqs"`
-	SNS           []ItemCost   `json:"sns"`
-	DynamoDB      []ItemCost   `json:"dynamodb"`
-	Total         float64      `json:"total"`
+	Lambda         []LambdaCost `json:"lambda"`
+	APIGateway     []ItemCost   `json:"api_gateway"`
+	StepFunctions  []ItemCost   `json:"step_functions"`
+	EventBridge    []ItemCost   `json:"eventbridge"`
+	SQS            []ItemCost   `json:"sqs"`
+	SNS            []ItemCost   `json:"sns"`
+	DynamoDB       []ItemCost   `json:"dynamodb"`
+	S3             []ItemCost   `json:"s3"`
+	Kinesis        []ItemCost   `json:"kinesis"`
+	EFS            []ItemCost   `json:"efs"`
+	SecretsManager []ItemCost   `json:"secrets_manager"`
+	Total          float64      `json:"total"`
 }
 
 // LambdaCost is the cost breakdown for one Lambda function.
@@ -264,7 +268,115 @@ func estimateServerless(g *model.Graph, usage *UsageProfile, p *RegionalPrices) 
 		sc.Total += cost
 	}
 
+	// S3.
+	for _, id := range sortedKeys(g.Buckets) {
+		bucket := g.Buckets[id]
+		u := usage.Buckets[id]
+		if u == nil {
+			continue
+		}
+		cost := s3Cost(u, p)
+		sc.S3 = append(sc.S3, ItemCost{
+			LogicalID: id,
+			Name:      bucket.BucketName,
+			Total:     cost,
+			Detail:    fmt.Sprintf("%.0fGB, %s PUTs, %s GETs", u.StorageGB, formatInt(u.MonthlyPuts), formatInt(u.MonthlyGets)),
+		})
+		sc.Total += cost
+	}
+
+	// Kinesis.
+	for _, id := range sortedKeys(g.Streams) {
+		stream := g.Streams[id]
+		u := usage.Streams[id]
+		if u == nil {
+			continue
+		}
+		cost := kinesisCost(stream, u, p)
+		sc.Kinesis = append(sc.Kinesis, ItemCost{
+			LogicalID: id,
+			Name:      stream.StreamName,
+			Total:     cost,
+			Detail:    fmt.Sprintf("%d shards, %s PUT records", stream.ShardCount, formatInt(u.MonthlyPutRecords)),
+		})
+		sc.Total += cost
+	}
+
+	// EFS.
+	for _, id := range sortedKeys(g.FileSystems) {
+		u := usage.FileSystems[id]
+		if u == nil {
+			continue
+		}
+		cost := efsCost(u, p)
+		sc.EFS = append(sc.EFS, ItemCost{
+			LogicalID: id,
+			Total:     cost,
+			Detail:    fmt.Sprintf("%.0fGB storage", u.StorageGB),
+		})
+		sc.Total += cost
+	}
+
+	// Secrets Manager. SSM Standard parameters are free and aren't costed.
+	for _, id := range sortedKeys(g.Secrets) {
+		secret := g.Secrets[id]
+		u := usage.Secrets[id]
+		if u == nil {
+			continue
+		}
+		cost := secretCost(u, p)
+		sc.SecretsManager = append(sc.SecretsManager, ItemCost{
+			LogicalID: id,
+			Name:      secret.Name,
+			Total:     cost,
+			Detail:    formatInt(u.MonthlyAPICalls) + " API calls",
+		})
+		sc.Total += cost
+	}
+
 	return sc
+}
+
+// s3Cost, kinesisCost, efsCost, and secretCost are shared between
+// estimateServerless (itemized current cost) and estimateECS (retained
+// cost — these resources aren't replaced by the migration, so the same
+// monthly cost carries over) to avoid the formulas drifting apart.
+
+func s3Cost(u *S3Usage, p *RegionalPrices) float64 {
+	if u == nil {
+		return 0
+	}
+	return u.StorageGB*p.S3.StandardStoragePerGBMonth +
+		float64(u.MonthlyPuts)/1000.0*p.S3.PutRequestsPerThousand +
+		float64(u.MonthlyGets)/1000.0*p.S3.GetRequestsPerThousand
+}
+
+func kinesisCost(stream *model.KinesisStream, u *KinesisUsage, p *RegionalPrices) float64 {
+	if u == nil {
+		return 0
+	}
+	shards := stream.ShardCount
+	if shards < 1 {
+		shards = 1
+	}
+	hoursPerMonth := 730.0
+	return float64(shards)*p.Kinesis.ShardPerHour*hoursPerMonth +
+		float64(u.MonthlyPutRecords)/1_000_000.0*p.Kinesis.PutPayloadUnitPerMillion
+}
+
+func efsCost(u *EFSUsage, p *RegionalPrices) float64 {
+	if u == nil {
+		return 0
+	}
+	return u.StorageGB * p.EFS.StandardStoragePerGBMonth
+}
+
+func secretCost(u *SecretUsage, p *RegionalPrices) float64 {
+	if u == nil {
+		return 0
+	}
+	return p.SecretsManager.PerSecretPerMonth +
+		float64(u.MonthlyAPICalls)/10_000.0*p.SecretsManager.APICallsPerTenThousand
 }
 
 func lambdaCost(fn *model.Lambda, u *LambdaUsage, p *RegionalPrices) LambdaCost {
@@ -338,6 +450,21 @@ func estimateECS(g *model.Graph, usage *UsageProfile, p *RegionalPrices) ECSCost
 			continue
 		}
 		ecs.Retained += float64(u.MonthlyPublishes) / 1_000_000.0 * p.SNS.PublishPerMillion
+	}
+	// S3, Kinesis, EFS, and Secrets Manager also aren't replaced by the
+	// migration — buckets/streams/file systems/secrets stay exactly as they
+	// are, just referenced by ECS tasks instead of Lambdas.
+	for id := range g.Buckets {
+		ecs.Retained += s3Cost(usage.Buckets[id], p)
+	}
+	for id, stream := range g.Streams {
+		ecs.Retained += kinesisCost(stream, usage.Streams[id], p)
+	}
+	for id := range g.FileSystems {
+		ecs.Retained += efsCost(usage.FileSystems[id], p)
+	}
+	for id := range g.Secrets {
+		ecs.Retained += secretCost(usage.Secrets[id], p)
 	}
 	ecs.Total += ecs.Retained
 
