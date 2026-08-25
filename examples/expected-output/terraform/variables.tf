@@ -76,3 +76,9 @@ variable "ecommerce_order_workflow_worker_desired_count" {
   default = 1
 }
 
+# ── Secrets (Secrets Manager / SSM Parameter Store) ─────────
+# Replace these defaults with the actual ARNs. The source column notes
+# where the value came from in the original template.
+
+# ── EFS (existing file systems — not created by this Terraform) ─
+

@@ -49,6 +49,8 @@ func TestEmitTerraform_GoldenFiles(t *testing.T) {
 		"alb.tf",
 		"scheduled.tf",
 		"sqs_pollers.tf",
+		"kinesis_consumers.tf",
+		"s3_event_processors.tf",
 		"outputs.tf",
 	}
 
@@ -110,7 +112,8 @@ func TestEmitTerraform_AllFilesCreated(t *testing.T) {
 
 	expected := []string{
 		"main.tf", "variables.tf", "ecs.tf", "alb.tf",
-		"scheduled.tf", "sqs_pollers.tf", "outputs.tf",
+		"scheduled.tf", "sqs_pollers.tf", "kinesis_consumers.tf",
+		"s3_event_processors.tf", "outputs.tf",
 	}
 	for _, name := range expected {
 		path := filepath.Join(tmpDir, name)

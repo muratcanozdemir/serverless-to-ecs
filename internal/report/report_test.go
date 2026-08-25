@@ -64,6 +64,79 @@ func TestBuildContext(t *testing.T) {
 	}
 }
 
+// TestBuildContext_NewResourceTypes verifies S3/Kinesis/EFS/Secrets/SSM
+// resources are surfaced in the report Context — previously these resource
+// types were modeled and costed but silently absent from the report.
+func TestBuildContext_NewResourceTypes(t *testing.T) {
+	g := testGraph()
+	g.Buckets["Bucket"] = &model.S3Bucket{LogicalID: "Bucket", BucketName: "uploads-bucket"}
+	g.Streams["Stream"] = &model.KinesisStream{LogicalID: "Stream", StreamName: "orders-stream", ShardCount: 2}
+	g.FileSystems["FS"] = &model.EFSFileSystem{LogicalID: "FS"}
+	g.Secrets["Secret"] = &model.SecretsManagerSecret{LogicalID: "Secret", Name: "db-secret"}
+	g.Parameters["Param"] = &model.SSMParameter{LogicalID: "Param", Name: "/app/config", Type: "String"}
+
+	est := testEstimate(t, g)
+	groups := cost.GroupServices(g)
+	ctx := buildContext(g, est, groups, "eu-central-1")
+
+	if ctx.Stack.Counts["buckets"] != 1 || ctx.Stack.Counts["streams"] != 1 ||
+		ctx.Stack.Counts["filesystems"] != 1 || ctx.Stack.Counts["secrets"] != 1 ||
+		ctx.Stack.Counts["parameters"] != 1 {
+		t.Errorf("expected all new resource counts to be 1, got %+v", ctx.Stack.Counts)
+	}
+	if len(ctx.Buckets) != 1 || ctx.Buckets[0].BucketName != "uploads-bucket" {
+		t.Errorf("expected one bucket detail, got %+v", ctx.Buckets)
+	}
+	if len(ctx.Streams) != 1 || ctx.Streams[0].StreamName != "orders-stream" || ctx.Streams[0].ShardCount != 2 {
+		t.Errorf("expected one stream detail, got %+v", ctx.Streams)
+	}
+	if len(ctx.FileSystems) != 1 || ctx.FileSystems[0].LogicalID != "FS" {
+		t.Errorf("expected one filesystem detail, got %+v", ctx.FileSystems)
+	}
+	if len(ctx.Secrets) != 1 || ctx.Secrets[0].Name != "db-secret" {
+		t.Errorf("expected one secret detail, got %+v", ctx.Secrets)
+	}
+	if len(ctx.Parameters) != 1 || ctx.Parameters[0].Name != "/app/config" {
+		t.Errorf("expected one parameter detail, got %+v", ctx.Parameters)
+	}
+}
+
+// TestWriteFallback_NewResourceTypesRendered verifies the fallback report
+// includes sections for the new resource types when present, and lists the
+// new Terraform files in the manifest.
+func TestWriteFallback_NewResourceTypesRendered(t *testing.T) {
+	g := testGraph()
+	g.Buckets["Bucket"] = &model.S3Bucket{LogicalID: "Bucket", BucketName: "uploads-bucket"}
+	g.Streams["Stream"] = &model.KinesisStream{LogicalID: "Stream", StreamName: "orders-stream", ShardCount: 2}
+	g.Secrets["Secret"] = &model.SecretsManagerSecret{LogicalID: "Secret", Name: "db-secret"}
+
+	est := testEstimate(t, g)
+	groups := cost.GroupServices(g)
+	outDir := t.TempDir()
+
+	if err := Generate(g, est, groups, Options{OutputDir: outDir, Region: "eu-central-1"}); err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(outDir, "report.md"))
+	if err != nil {
+		t.Fatalf("read report.md: %v", err)
+	}
+	content := string(data)
+
+	for _, want := range []string{
+		"uploads-bucket",
+		"orders-stream",
+		"db-secret",
+		"kinesis_consumers.tf",
+		"s3_event_processors.tf",
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("expected report to contain %q, got:\n%s", want, content)
+		}
+	}
+}
+
 func TestGenerate_FallbackWhenNoLLMEndpoint(t *testing.T) {
 	g := testGraph()
 	est := testEstimate(t, g)

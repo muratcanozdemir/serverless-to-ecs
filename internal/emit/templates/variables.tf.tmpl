@@ -45,3 +45,30 @@ variable "{{ tfident .Name }}_desired_count" {
   default = {{ .DesiredCount }}
 }
 {{ end }}
+# ── Secrets (Secrets Manager / SSM Parameter Store) ─────────
+# Replace these defaults with the actual ARNs. The source column notes
+# where the value came from in the original template.
+{{ range .Services }}
+{{- $svc := . }}
+{{- range .Secrets }}
+variable "{{ .VarName }}" {
+  type        = string
+  description = "{{ $svc.Name }}: {{ .Key }} ({{ .Kind }}, source: {{ .SourceHint }})"
+  default     = "TODO_REPLACE_WITH_ARN"
+}
+{{ end }}
+{{- end }}
+# ── EFS (existing file systems — not created by this Terraform) ─
+{{ range .Services }}
+{{- $svc := . }}
+{{- range .EFSMounts }}
+variable "{{ .FileSystemVar }}" {
+  type        = string
+  description = "EFS file system ID to mount into {{ $svc.Name }} at {{ .ContainerPath }}"
+}
+variable "{{ .AccessPointVar }}" {
+  type        = string
+  description = "EFS access point ID to mount into {{ $svc.Name }} at {{ .ContainerPath }}"
+}
+{{ end }}
+{{- end }}

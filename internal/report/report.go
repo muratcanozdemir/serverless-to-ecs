@@ -46,6 +46,11 @@ type Context struct {
 	Rules       []RuleDetail                `json:"eventbridge_rules"`
 	Queues      []QueueDetail               `json:"sqs_queues"`
 	Tables      []TableDetail               `json:"dynamodb_tables"`
+	Buckets     []BucketDetail              `json:"s3_buckets"`
+	Streams     []StreamDetail              `json:"kinesis_streams"`
+	FileSystems []FileSystemDetail          `json:"efs_filesystems"`
+	Secrets     []SecretDetail              `json:"secrets"`
+	Parameters  []ParameterDetail           `json:"ssm_parameters"`
 	Cost        *cost.Estimate              `json:"cost_estimate"`
 	Groups      []cost.ServiceGroup         `json:"service_groups"`
 	Unsupported []model.UnsupportedResource `json:"unsupported_resources"`
@@ -111,6 +116,32 @@ type TableDetail struct {
 	GSICount    int    `json:"gsi_count"`
 }
 
+type BucketDetail struct {
+	LogicalID  string `json:"logical_id"`
+	BucketName string `json:"bucket_name"`
+}
+
+type StreamDetail struct {
+	LogicalID  string `json:"logical_id"`
+	StreamName string `json:"stream_name"`
+	ShardCount int    `json:"shard_count"`
+}
+
+type FileSystemDetail struct {
+	LogicalID string `json:"logical_id"`
+}
+
+type SecretDetail struct {
+	LogicalID string `json:"logical_id"`
+	Name      string `json:"name"`
+}
+
+type ParameterDetail struct {
+	LogicalID string `json:"logical_id"`
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+}
+
 // Generate produces the migration report. Tries LLM if endpoint is configured,
 // falls back to bare data dump otherwise.
 func Generate(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup, opts Options) error {
@@ -149,6 +180,11 @@ func buildContext(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup
 				"queues":      len(g.Queues),
 				"topics":      len(g.Topics),
 				"tables":      len(g.Tables),
+				"buckets":     len(g.Buckets),
+				"streams":     len(g.Streams),
+				"filesystems": len(g.FileSystems),
+				"secrets":     len(g.Secrets),
+				"parameters":  len(g.Parameters),
 				"unsupported": len(g.Unsupported),
 			},
 		},
@@ -228,6 +264,47 @@ func buildContext(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup
 			HashKey:     t.HashKey,
 			RangeKey:    t.RangeKey,
 			GSICount:    t.GSICount,
+		})
+	}
+
+	for _, id := range sortedKeys(g.Buckets) {
+		b := g.Buckets[id]
+		ctx.Buckets = append(ctx.Buckets, BucketDetail{
+			LogicalID:  b.LogicalID,
+			BucketName: b.BucketName,
+		})
+	}
+
+	for _, id := range sortedKeys(g.Streams) {
+		s := g.Streams[id]
+		ctx.Streams = append(ctx.Streams, StreamDetail{
+			LogicalID:  s.LogicalID,
+			StreamName: s.StreamName,
+			ShardCount: s.ShardCount,
+		})
+	}
+
+	for _, id := range sortedKeys(g.FileSystems) {
+		fs := g.FileSystems[id]
+		ctx.FileSystems = append(ctx.FileSystems, FileSystemDetail{
+			LogicalID: fs.LogicalID,
+		})
+	}
+
+	for _, id := range sortedKeys(g.Secrets) {
+		s := g.Secrets[id]
+		ctx.Secrets = append(ctx.Secrets, SecretDetail{
+			LogicalID: s.LogicalID,
+			Name:      s.Name,
+		})
+	}
+
+	for _, id := range sortedKeys(g.Parameters) {
+		p := g.Parameters[id]
+		ctx.Parameters = append(ctx.Parameters, ParameterDetail{
+			LogicalID: p.LogicalID,
+			Name:      p.Name,
+			Type:      p.Type,
 		})
 	}
 
@@ -369,6 +446,47 @@ func writeFallback(ctx *Context, outPath string) error {
 		b.WriteString("\n")
 	}
 
+	// S3 buckets.
+	if len(ctx.Buckets) > 0 {
+		b.WriteString("## S3 Buckets\n\n")
+		b.WriteString("| Bucket |\n|---|\n")
+		for _, bucket := range ctx.Buckets {
+			b.WriteString(fmt.Sprintf("| %s |\n", bucket.BucketName))
+		}
+		b.WriteString("\n")
+	}
+
+	// Kinesis streams.
+	if len(ctx.Streams) > 0 {
+		b.WriteString("## Kinesis Streams\n\n")
+		b.WriteString("| Stream | Shards |\n|---|---|\n")
+		for _, s := range ctx.Streams {
+			b.WriteString(fmt.Sprintf("| %s | %d |\n", s.StreamName, s.ShardCount))
+		}
+		b.WriteString("\n")
+	}
+
+	// EFS file systems.
+	if len(ctx.FileSystems) > 0 {
+		b.WriteString("## EFS File Systems\n\n")
+		for _, fs := range ctx.FileSystems {
+			b.WriteString(fmt.Sprintf("- %s\n", fs.LogicalID))
+		}
+		b.WriteString("\n")
+	}
+
+	// Secrets and parameters.
+	if len(ctx.Secrets) > 0 || len(ctx.Parameters) > 0 {
+		b.WriteString("## Secrets Manager / SSM Parameter Store\n\n")
+		for _, s := range ctx.Secrets {
+			b.WriteString(fmt.Sprintf("- %s (Secrets Manager)\n", s.Name))
+		}
+		for _, p := range ctx.Parameters {
+			b.WriteString(fmt.Sprintf("- %s (SSM %s)\n", p.Name, p.Type))
+		}
+		b.WriteString("\n")
+	}
+
 	// Step Functions.
 	if len(ctx.StepFuncs) > 0 {
 		b.WriteString("## Step Functions\n\n")
@@ -405,6 +523,10 @@ func writeFallback(ctx *Context, outPath string) error {
 		{"EventBridge", ctx.Cost.Serverless.EventBridge},
 		{"SQS", ctx.Cost.Serverless.SQS},
 		{"DynamoDB", ctx.Cost.Serverless.DynamoDB},
+		{"S3", ctx.Cost.Serverless.S3},
+		{"Kinesis", ctx.Cost.Serverless.Kinesis},
+		{"EFS", ctx.Cost.Serverless.EFS},
+		{"Secrets Manager / SSM", ctx.Cost.Serverless.SecretsManager},
 	} {
 		if len(label.items) > 0 {
 			b.WriteString(fmt.Sprintf("**%s:**\n\n", label.name))
@@ -426,7 +548,7 @@ func writeFallback(ctx *Context, outPath string) error {
 		b.WriteString("\n")
 	}
 	b.WriteString(fmt.Sprintf("- ALB: $%.2f\n", ctx.Cost.ECS.ALB))
-	b.WriteString(fmt.Sprintf("- Retained (DynamoDB, SQS, SNS): $%.2f\n", ctx.Cost.ECS.Retained))
+	b.WriteString(fmt.Sprintf("- Retained (DynamoDB, SQS, SNS, S3, Kinesis, EFS, Secrets Manager/SSM): $%.2f\n", ctx.Cost.ECS.Retained))
 	b.WriteString(fmt.Sprintf("\n**Total ECS: $%.2f/month**\n\n", ctx.Cost.ECS.Total))
 
 	delta := ctx.Cost.Savings.DeltaAbsolute
@@ -465,6 +587,8 @@ func writeFallback(ctx *Context, outPath string) error {
 	b.WriteString("- `alb.tf` — Application Load Balancer, strangler routing\n")
 	b.WriteString("- `scheduled.tf` — ECS scheduled tasks (replaces EventBridge→Lambda)\n")
 	b.WriteString("- `sqs_pollers.tf` — Queue consumer documentation\n")
+	b.WriteString("- `kinesis_consumers.tf` — Kinesis stream consumer documentation\n")
+	b.WriteString("- `s3_event_processors.tf` — S3 event processor documentation\n")
 	b.WriteString("- `outputs.tf` — ALB DNS, cluster ARN\n")
 
 	return os.WriteFile(outPath, []byte(b.String()), 0644)

@@ -86,6 +86,8 @@ output/
     ├── alb.tf             # ALB with strangler routing
     ├── scheduled.tf       # ECS scheduled tasks (replaces EventBridge cron)
     ├── sqs_pollers.tf     # Queue consumer documentation
+    ├── kinesis_consumers.tf  # Kinesis stream consumer documentation
+    ├── s3_event_processors.tf  # S3 event processor documentation
     └── outputs.tf         # ALB DNS, cluster ARN
 ```
 
@@ -122,10 +124,43 @@ output/
 | `AWS::SNS::Topic` | ✓ | Subscription → Lambda/SQS |
 | `AWS::DynamoDB::Table` | ✓ | — |
 | `AWS::Serverless::SimpleTable` | ✓ | — |
+| `AWS::S3::Bucket` | ✓ | NotificationConfiguration → Lambda |
+| `AWS::Kinesis::Stream` | ✓ | EventSourceMapping → Lambda |
+| `AWS::EFS::FileSystem` / `AWS::EFS::AccessPoint` | ✓ | Lambda FileSystemConfigs → AccessPoint |
+| `AWS::SecretsManager::Secret` | ✓ | Lambda env var (Ref/GetAtt or `{{resolve:secretsmanager:...}}`) → Secret |
+| `AWS::SSM::Parameter` | ✓ | Lambda env var (Ref/GetAtt or `{{resolve:ssm:...}}`) → Parameter |
+| Lambda `VpcConfig` | ✓ | documented on the ECS service, not auto-wired (see below) |
 
 Wiring resources (IAM roles, Lambda permissions, log groups, API Gateway
 stages/deployments) are used for edge detection but not modeled as inventory.
 Unsupported resource types are captured and flagged in the report.
+
+**Out of scope by design:** API Gateway is left in place rather than migrated
+to an ALB/NLB — if Route53 already points at it, that's left alone too. Fronting
+ECS with a load balancer means rewriting DNS, which is a deliberate operator
+decision this tool doesn't make for you.
+
+**VPC config, EFS, and Secrets Manager/SSM are documented, not auto-wired:**
+- A Lambda's `VpcConfig` (subnets/security groups) is almost always expressed
+  via `Ref`/`Fn::ImportValue` to values that don't resolve to a literal ID at
+  parse time, so the emitter adds a comment on the ECS service noting the
+  original subnet/security-group refs for manual verification rather than
+  guessing at equivalent networking.
+- EFS access points are wired into the ECS task as `efs_volume_configuration`
+  + `mountPoints`, with `platform_version` bumped to `1.4.0` (required for EFS
+  on Fargate) — but the file system/access point IDs are left as required
+  Terraform variables (no default) since they're existing infrastructure this
+  tool doesn't create.
+- Secrets Manager/SSM-backed env vars are detected (both via direct
+  Ref/GetAtt and via CloudFormation's `{{resolve:...}}` dynamic-reference
+  syntax) and rendered through ECS's native `secrets` container field
+  (`valueFrom` an ARN variable) instead of being inlined into `environment`
+  — the ARN variable defaults to a `TODO_REPLACE_WITH_ARN` placeholder.
+- Kinesis and S3 can't invoke a long-running ECS container the way they
+  invoke Lambda, so `kinesis_consumers.tf` / `s3_event_processors.tf`
+  document the reconfiguration needed (KCL-based consumer, or an
+  EventBridge/SQS relay for S3) rather than generating infrastructure that
+  would silently change the bucket's/stream's existing configuration.
 
 ### Strangler migration pattern
 

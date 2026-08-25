@@ -42,6 +42,10 @@ resource "aws_ecs_task_definition" "orderapi_svc" {
       { name = "ORDER_TABLE", value = "TODO_OrderTable" },
       { name = "STAGE", value = "production" },
     ]
+    secrets = [
+    ]
+    mountPoints = [
+    ]
 
     logConfiguration = {
       logDriver = "awslogs"
@@ -106,6 +110,10 @@ resource "aws_ecs_task_definition" "orderqueue_processor" {
       { name = "ORDER_TABLE", value = "TODO_OrderTable" },
       { name = "STAGE", value = "production" },
     ]
+    secrets = [
+    ]
+    mountPoints = [
+    ]
 
     logConfiguration = {
       logDriver = "awslogs"
@@ -162,6 +170,10 @@ resource "aws_ecs_task_definition" "scheduled_tasks" {
       { name = "ORDER_TABLE", value = "TODO_OrderTable" },
       { name = "STAGE", value = "production" },
     ]
+    secrets = [
+    ]
+    mountPoints = [
+    ]
 
     logConfiguration = {
       logDriver = "awslogs"
@@ -203,6 +215,10 @@ resource "aws_ecs_task_definition" "ecommerce_order_workflow_worker" {
       { name = "STAGE", value = "production" },
       { name = "ORDER_TABLE", value = "TODO_OrderTable" },
       { name = "NOTIFICATION_TOPIC", value = "TODO_NotificationTopic" },
+    ]
+    secrets = [
+    ]
+    mountPoints = [
     ]
 
     logConfiguration = {
