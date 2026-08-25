@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 
 	"serverless-to-ecs/internal/cost"
 	"serverless-to-ecs/internal/emit"
@@ -13,6 +14,17 @@ import (
 	"serverless-to-ecs/internal/parser"
 	"serverless-to-ecs/internal/report"
 )
+
+// sortedKeys returns a map's keys in sorted order, so summary output lists
+// resources in a deterministic order instead of Go's randomized map order.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
 
 // Run is the CLI entrypoint. Returns exit code.
 func Run() int {
@@ -129,7 +141,8 @@ func printSummary(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup
 	// Lambda details.
 	if len(g.Lambdas) > 0 {
 		fmt.Println("Lambda functions:")
-		for _, fn := range g.Lambdas {
+		for _, id := range sortedKeys(g.Lambdas) {
+			fn := g.Lambdas[id]
 			fmt.Printf("  %-35s %s  %4dMB  %3ds\n",
 				fn.FunctionName, fn.Runtime, fn.MemoryMB, fn.TimeoutSec)
 		}
@@ -139,7 +152,8 @@ func printSummary(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup
 	// Step Functions.
 	if len(g.StepFuncs) > 0 {
 		fmt.Println("Step Functions:")
-		for _, sf := range g.StepFuncs {
+		for _, id := range sortedKeys(g.StepFuncs) {
+			sf := g.StepFuncs[id]
 			fmt.Printf("  %-35s pattern=%-12s states=%d tasks=%d\n",
 				sf.Name, sf.Pattern, sf.StateCount, len(sf.TaskTargets))
 		}

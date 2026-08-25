@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"text/template"
 	"time"
@@ -48,6 +50,7 @@ type ServiceData struct {
 // APIServiceData extends ServiceData with ALB routing info.
 type APIServiceData struct {
 	Name     string
+	TGName   string // target group name, pre-truncated to AWS's 32-char limit
 	Priority int
 	Paths    []string
 }
@@ -58,6 +61,7 @@ type ScheduleData struct {
 	Schedule      string
 	SourceLambdas []string
 	TaskDefRef    string
+	Resolved      bool // false if TaskDefRef couldn't be matched to a generated task definition
 }
 
 // QueuePollerData represents an SQS→Lambda mapping migrated to an ECS poller.
@@ -65,12 +69,18 @@ type QueuePollerData struct {
 	QueueName     string
 	ServiceName   string
 	SourceLambdas []string
+	Resolved      bool // false if ServiceName couldn't be matched to a generated service group
 }
 
-// EnvVar is a key-value pair for container environment.
+// EnvVar is a key-value pair for container environment. KeyQuoted/ValueQuoted
+// hold the Go-quoted (strconv.Quote) form so templates can interpolate them
+// into HCL string literals without needing to re-escape user-controlled
+// content (quotes, backslashes, newlines) themselves.
 type EnvVar struct {
-	Key   string
-	Value string
+	Key         string
+	Value       string
+	KeyQuoted   string
+	ValueQuoted string
 }
 
 // EnvVarHint is used in the main.tf IAM TODO comments.
@@ -90,9 +100,6 @@ func EmitTerraform(g *model.Graph, groups []cost.ServiceGroup, templatePath, reg
 	funcMap := template.FuncMap{
 		"tfident": tfIdent,
 		"join":    strings.Join,
-		"min":     minInt,
-		"len":     strLen,
-		"substr":  substr,
 	}
 
 	files := []struct {
@@ -165,6 +172,7 @@ func assembleTerraformData(g *model.Graph, groups []cost.ServiceGroup, templateP
 			}
 			data.APIServices = append(data.APIServices, APIServiceData{
 				Name:     grp.Name,
+				TGName:   truncateName(grp.Name, 32),
 				Priority: priority,
 				Paths:    paths,
 			})
@@ -174,43 +182,51 @@ func assembleTerraformData(g *model.Graph, groups []cost.ServiceGroup, templateP
 	}
 
 	// Schedules: from EventBridge rules and SAM schedule events.
-	for ruleID, rule := range g.Rules {
+	for _, ruleID := range sortedKeys(g.Rules) {
+		rule := g.Rules[ruleID]
 		if rule.Schedule == "" {
 			continue
 		}
 		lambdas := findTriggeredLambdas(g, ruleID)
-		taskDef := findServiceForLambdas(groups, lambdas)
+		taskDef, resolved := findServiceForLambdas(groups, lambdas)
 		data.Schedules = append(data.Schedules, ScheduleData{
 			Name:          sanitize(rule.Name),
 			Schedule:      rule.Schedule,
 			SourceLambdas: lambdas,
 			TaskDefRef:    taskDef,
+			Resolved:      resolved,
 		})
 	}
 
 	// Queue pollers: from SQS→Lambda edges.
-	for queueID, q := range g.Queues {
+	for _, queueID := range sortedKeys(g.Queues) {
+		q := g.Queues[queueID]
 		lambdas := findTriggeredLambdas(g, queueID)
 		if len(lambdas) == 0 {
 			continue
 		}
-		svcName := findServiceForLambdas(groups, lambdas)
+		svcName, resolved := findServiceForLambdas(groups, lambdas)
 		data.QueuePollers = append(data.QueuePollers, QueuePollerData{
 			QueueName:     q.QueueName,
 			ServiceName:   svcName,
 			SourceLambdas: lambdas,
+			Resolved:      resolved,
 		})
 	}
 
-	// Env var hints for IAM TODOs.
-	for _, fn := range g.Lambdas {
+	// Env var hints for IAM TODOs. These are emitted as raw text inside a
+	// "#"-comment line in main.tf.tmpl, so any newline must be stripped —
+	// otherwise a value containing "\n" could break out of the comment and
+	// inject arbitrary Terraform.
+	for _, fnID := range sortedKeys(g.Lambdas) {
+		fn := g.Lambdas[fnID]
 		if len(fn.EnvVars) > 0 {
 			hints := make([]string, 0, len(fn.EnvVars))
-			for k, v := range fn.EnvVars {
-				hints = append(hints, k+"="+v)
+			for _, k := range sortedKeys(fn.EnvVars) {
+				hints = append(hints, singleLine(k)+"="+singleLine(fn.EnvVars[k]))
 			}
 			data.EnvVarSummary = append(data.EnvVarSummary, EnvVarHint{
-				FunctionName: fn.FunctionName,
+				FunctionName: singleLine(fn.FunctionName),
 				Hint:         strings.Join(hints, ", "),
 			})
 		}
@@ -221,27 +237,45 @@ func assembleTerraformData(g *model.Graph, groups []cost.ServiceGroup, templateP
 
 // --- Helpers ---
 
+// sortedKeys returns a map's keys in sorted order — deterministic iteration
+// is load-bearing here, since it determines the order resources are written
+// to the generated .tf files. Without it, the exact same input template
+// produces differently-ordered (though semantically equivalent) Terraform on
+// every run, which is disruptive when the output is checked into version
+// control and regenerated in CI.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 // tfIdent converts a name to a valid Terraform identifier (underscores, no hyphens).
 func tfIdent(s string) string {
 	return strings.NewReplacer("-", "_", ".", "_", " ", "_").Replace(s)
 }
 
-func minInt(a, b int) int {
-	if a < b {
-		return a
+// truncateName cuts s to at most maxLen runes — used for AWS resource names
+// with hard length limits (e.g. an ALB target group name is capped at 32
+// chars). Truncates by rune, not byte, so multi-byte UTF-8 input isn't split
+// mid-character.
+func truncateName(s string, maxLen int) string {
+	r := []rune(s)
+	if len(r) <= maxLen {
+		return s
 	}
-	return b
+	return string(r[:maxLen])
 }
 
-func strLen(s string) int {
-	return len(s)
-}
-
-func substr(s string, start, end int) string {
-	if end > len(s) {
-		end = len(s)
-	}
-	return s[start:end]
+// singleLine collapses newlines so a value is safe to embed in a single-line
+// "#"-comment in generated Terraform, where a literal newline would otherwise
+// terminate the comment and let the rest of the value become live HCL.
+func singleLine(s string) string {
+	s = strings.ReplaceAll(s, "\r\n", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	return strings.ReplaceAll(s, "\r", " ")
 }
 
 // fargateCPU returns Fargate CPU units based on the highest memory Lambda in the group.
@@ -311,7 +345,8 @@ func collectEnvVars(g *model.Graph, lambdaIDs []string) []EnvVar {
 		if !ok {
 			continue
 		}
-		for k, v := range fn.EnvVars {
+		for _, k := range sortedKeys(fn.EnvVars) {
+			v := fn.EnvVars[k]
 			if seen[k] {
 				continue
 			}
@@ -320,7 +355,12 @@ func collectEnvVars(g *model.Graph, lambdaIDs []string) []EnvVar {
 			if strings.HasPrefix(v, "${") {
 				v = "TODO_" + strings.TrimSuffix(strings.TrimPrefix(v, "${"), "}")
 			}
-			vars = append(vars, EnvVar{Key: k, Value: v})
+			vars = append(vars, EnvVar{
+				Key:         k,
+				Value:       v,
+				KeyQuoted:   strconv.Quote(k),
+				ValueQuoted: strconv.Quote(v),
+			})
 		}
 	}
 	return vars
@@ -369,7 +409,12 @@ func findTriggeredLambdas(g *model.Graph, sourceID string) []string {
 	return lambdas
 }
 
-func findServiceForLambdas(groups []cost.ServiceGroup, lambdaIDs []string) string {
+// findServiceForLambdas looks up the generated service group name that owns
+// any of the given Lambdas. The returned bool reports whether a match was
+// found in groups — callers must not reference a Terraform resource built
+// from this name unless it's true, since an unresolved name doesn't
+// correspond to any task definition/service actually emitted.
+func findServiceForLambdas(groups []cost.ServiceGroup, lambdaIDs []string) (string, bool) {
 	idSet := make(map[string]bool)
 	for _, id := range lambdaIDs {
 		idSet[id] = true
@@ -377,24 +422,18 @@ func findServiceForLambdas(groups []cost.ServiceGroup, lambdaIDs []string) strin
 	for _, grp := range groups {
 		for _, id := range grp.LambdaIDs {
 			if idSet[id] {
-				return grp.Name
+				return grp.Name, true
 			}
 		}
 	}
-	if len(lambdaIDs) > 0 {
-		return sanitize(lambdaIDs[0])
-	}
-	return "unknown"
+	return "unknown", false
 }
 
 func deriveProjectName(g *model.Graph) string {
 	if g.Description != "" {
 		words := strings.Fields(g.Description)
 		if len(words) > 0 {
-			name := strings.ToLower(words[0])
-			if len(name) > 20 {
-				name = name[:20]
-			}
+			name := truncateName(strings.ToLower(words[0]), 20)
 			return sanitize(name)
 		}
 	}

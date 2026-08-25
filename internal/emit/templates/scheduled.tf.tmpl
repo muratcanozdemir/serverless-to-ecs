@@ -11,6 +11,7 @@ resource "aws_cloudwatch_event_rule" "{{ tfident .Name }}" {
   tags                = local.tags
 }
 
+{{ if .Resolved }}
 resource "aws_cloudwatch_event_target" "{{ tfident .Name }}" {
   rule     = aws_cloudwatch_event_rule.{{ tfident .Name }}.name
   arn      = aws_ecs_cluster.main.arn
@@ -27,5 +28,10 @@ resource "aws_cloudwatch_event_target" "{{ tfident .Name }}" {
     }
   }
 }
+{{ else }}
+# TODO: could not determine which ECS task definition should run on this
+# schedule (no source Lambda resolved to a generated service group). Add an
+# aws_cloudwatch_event_target manually once the target service is known.
+{{ end }}
 {{ end }}
 {{ end }}

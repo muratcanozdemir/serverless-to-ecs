@@ -1,10 +1,26 @@
 package parser
 
 import (
+	"sort"
 	"strings"
 
 	"serverless-to-ecs/internal/model"
 )
+
+// sortedStringKeys returns a map's keys in sorted order. Several CFN
+// properties (SAM Events, env var Variables) are unordered JSON objects, but
+// the order in which they're processed here determines the order of edges
+// added to the graph — and downstream, the order of generated Terraform
+// resources — so iterating in Go's randomized map order would make output
+// non-reproducible between runs of the same template.
+func sortedStringKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
 
 // resolveEdges examines a resource's properties for references to other resources
 // and creates typed edges in the graph. Called once per resource in the second pass.
@@ -38,6 +54,11 @@ func resolveEdges(g *model.Graph, logicalID string, res RawResource) {
 
 // resolveEventSourceMapping handles AWS::Lambda::EventSourceMapping.
 // These wire SQS queues (or DynamoDB streams, Kinesis) to Lambda functions.
+//
+// Known limitation: only Ref/Fn::GetAtt forms of FunctionName/EventSourceArn are
+// resolved. A literal ARN string or an Fn::ImportValue (common when the queue or
+// function is defined in a different stack) has no logical ID in this template's
+// graph to link to, so the trigger edge is silently skipped rather than guessed at.
 func resolveEventSourceMapping(g *model.Graph, _ string, props map[string]interface{}) {
 	fnRef := resolveRef(props["FunctionName"])
 	sourceRef := resolveRef(props["EventSourceArn"])
@@ -97,27 +118,55 @@ func resolveAPIGatewayMethod(g *model.Graph, _ string, props map[string]interfac
 	g.AddEdge(apiRef, lambdaRef, model.EdgeInvokes, method+" "+path)
 }
 
-// resolveHTTPAPIRoute handles HTTP API (v2) routes.
+// resolveHTTPAPIRoute handles HTTP API (v2) routes. A Route's Target property
+// references an AWS::ApiGatewayV2::Integration (typically
+// Fn::Sub: "integrations/${MyIntegration}"), not a Lambda directly, so it's
+// resolved via g.HTTPIntegrations (populated during extraction from each
+// Integration's IntegrationUri) to find the actual Lambda target.
 func resolveHTTPAPIRoute(g *model.Graph, _ string, props map[string]interface{}) {
 	apiRef := resolveRef(props["ApiId"])
 	routeKey := getString(props, "RouteKey") // e.g., "GET /items"
 
-	targetRef := resolveRef(props["Target"])
-	if targetRef == "" {
+	integrationID := extractIntegrationID(props["Target"])
+	if integrationID == "" {
+		return
+	}
+	lambdaRef, ok := g.HTTPIntegrations[integrationID]
+	if !ok || lambdaRef == "" {
 		return
 	}
 
-	// Target is usually an integration, not a Lambda directly.
-	// For the graph, we record the route. Edge resolution for HTTP APIs
-	// is less reliable than REST APIs without also reading the Integration resource.
 	if apiRef != "" && routeKey != "" {
 		g.Routes = append(g.Routes, model.APIRoute{
 			APIID:     apiRef,
 			Path:      routeKey,
 			Method:    "",
-			TargetRef: targetRef,
+			TargetRef: lambdaRef,
 		})
 	}
+	g.AddEdge(apiRef, lambdaRef, model.EdgeInvokes, routeKey)
+}
+
+// extractIntegrationID pulls the Integration logical ID out of a Route's Target
+// property, which is a literal "integrations/{id}" string or (far more commonly)
+// an Fn::Sub of the same shape, e.g. Fn::Sub: "integrations/${MyIntegration}".
+func extractIntegrationID(target interface{}) string {
+	switch v := target.(type) {
+	case string:
+		return strings.TrimPrefix(v, "integrations/")
+	case map[string]interface{}:
+		switch sub := v["Fn::Sub"].(type) {
+		case string:
+			return extractSubRef(sub)
+		case []interface{}:
+			if len(sub) > 0 {
+				if s, ok := sub[0].(string); ok {
+					return extractSubRef(s)
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // resolveEventBridgeTargets creates edges from EventBridge rules to their targets.
@@ -176,8 +225,8 @@ func resolveLambdaEnvRefs(g *model.Graph, logicalID string, props map[string]int
 		return
 	}
 
-	for _, v := range vars {
-		ref := resolveRef(v)
+	for _, k := range sortedStringKeys(vars) {
+		ref := resolveRef(vars[k])
 		if ref == "" {
 			continue
 		}
@@ -202,8 +251,8 @@ func extractSAMEvents(g *model.Graph, logicalID string, res RawResource) {
 		return
 	}
 
-	for eventName, eventRaw := range events {
-		event, ok := eventRaw.(map[string]interface{})
+	for _, eventName := range sortedStringKeys(events) {
+		event, ok := events[eventName].(map[string]interface{})
 		if !ok {
 			continue
 		}
@@ -270,9 +319,18 @@ func extractLambdaFromIntegrationURI(uri interface{}) string {
 	}
 
 	// Sub expression: look for ${LogicalID} or ${LogicalID.Arn} patterns.
+	// Fn::Sub has both a plain-string form and a 2-element array form
+	// (["...${Var}...", {"Var": {...}}]) used when substituting multiple refs.
 	if m, ok := uri.(map[string]interface{}); ok {
-		if sub, ok := m["Fn::Sub"].(string); ok {
+		switch sub := m["Fn::Sub"].(type) {
+		case string:
 			return extractSubRef(sub)
+		case []interface{}:
+			if len(sub) > 0 {
+				if s, ok := sub[0].(string); ok {
+					return extractSubRef(s)
+				}
+			}
 		}
 	}
 

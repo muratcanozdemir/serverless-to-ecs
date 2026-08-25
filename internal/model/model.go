@@ -130,6 +130,12 @@ type Graph struct {
 	Topics     map[string]*SNSTopic
 	Tables     map[string]*DynamoDBTable
 
+	// HTTPIntegrations maps an AWS::ApiGatewayV2::Integration logical ID to
+	// the Lambda logical ID it targets (resolved from IntegrationUri). Used
+	// to link HTTP API (v2) Routes, which reference an Integration rather
+	// than a Lambda directly, back to the Lambda they invoke.
+	HTTPIntegrations map[string]string
+
 	Edges []Edge
 
 	// Resources we detected but don't model. Preserved for the report
@@ -146,13 +152,14 @@ type UnsupportedResource struct {
 // NewGraph returns an initialized empty graph.
 func NewGraph() *Graph {
 	return &Graph{
-		Lambdas:   make(map[string]*Lambda),
-		APIs:      make(map[string]*APIGateway),
-		StepFuncs: make(map[string]*StepFunction),
-		Rules:     make(map[string]*EventBridgeRule),
-		Queues:    make(map[string]*SQSQueue),
-		Topics:    make(map[string]*SNSTopic),
-		Tables:    make(map[string]*DynamoDBTable),
+		Lambdas:          make(map[string]*Lambda),
+		APIs:             make(map[string]*APIGateway),
+		StepFuncs:        make(map[string]*StepFunction),
+		Rules:            make(map[string]*EventBridgeRule),
+		Queues:           make(map[string]*SQSQueue),
+		Topics:           make(map[string]*SNSTopic),
+		Tables:           make(map[string]*DynamoDBTable),
+		HTTPIntegrations: make(map[string]string),
 	}
 }
 

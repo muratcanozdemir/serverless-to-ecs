@@ -8,12 +8,26 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"serverless-to-ecs/internal/cost"
 	"serverless-to-ecs/internal/model"
 )
+
+// sortedKeys returns a map's keys in sorted order, so the resource lists
+// built below have a deterministic order instead of Go's randomized map
+// order — otherwise the report (and the LLM prompt built from it) would
+// list the same stack's resources in a different order on every run.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
 
 // Options configures the report generator.
 type Options struct {
@@ -143,7 +157,8 @@ func buildContext(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup
 		Unsupported: g.Unsupported,
 	}
 
-	for _, fn := range g.Lambdas {
+	for _, id := range sortedKeys(g.Lambdas) {
+		fn := g.Lambdas[id]
 		ctx.Lambdas = append(ctx.Lambdas, LambdaDetail{
 			LogicalID:    fn.LogicalID,
 			FunctionName: fn.FunctionName,
@@ -154,7 +169,8 @@ func buildContext(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup
 		})
 	}
 
-	for apiID, api := range g.APIs {
+	for _, apiID := range sortedKeys(g.APIs) {
+		api := g.APIs[apiID]
 		ad := APIDetail{
 			LogicalID: apiID,
 			Name:      api.Name,
@@ -172,7 +188,8 @@ func buildContext(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup
 		ctx.APIs = append(ctx.APIs, ad)
 	}
 
-	for _, sf := range g.StepFuncs {
+	for _, id := range sortedKeys(g.StepFuncs) {
+		sf := g.StepFuncs[id]
 		ctx.StepFuncs = append(ctx.StepFuncs, StepFuncDetail{
 			LogicalID:   sf.LogicalID,
 			Name:        sf.Name,
@@ -183,7 +200,8 @@ func buildContext(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup
 		})
 	}
 
-	for _, rule := range g.Rules {
+	for _, id := range sortedKeys(g.Rules) {
+		rule := g.Rules[id]
 		ctx.Rules = append(ctx.Rules, RuleDetail{
 			LogicalID: rule.LogicalID,
 			Name:      rule.Name,
@@ -192,7 +210,8 @@ func buildContext(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup
 		})
 	}
 
-	for _, q := range g.Queues {
+	for _, id := range sortedKeys(g.Queues) {
+		q := g.Queues[id]
 		ctx.Queues = append(ctx.Queues, QueueDetail{
 			LogicalID: q.LogicalID,
 			QueueName: q.QueueName,
@@ -200,7 +219,8 @@ func buildContext(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup
 		})
 	}
 
-	for _, t := range g.Tables {
+	for _, id := range sortedKeys(g.Tables) {
+		t := g.Tables[id]
 		ctx.Tables = append(ctx.Tables, TableDetail{
 			LogicalID:   t.LogicalID,
 			TableName:   t.TableName,

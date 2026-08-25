@@ -41,7 +41,7 @@ resource "aws_ecs_task_definition" "{{ tfident .Name }}" {
 
     environment = [
 {{- range .EnvVars }}
-      { name = "{{ .Key }}", value = "{{ .Value }}" },
+      { name = {{ .KeyQuoted }}, value = {{ .ValueQuoted }} },
 {{- end }}
     ]
 

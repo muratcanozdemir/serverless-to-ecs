@@ -1,6 +1,8 @@
 package parser
 
 import (
+	"encoding/json"
+
 	"serverless-to-ecs/internal/model"
 )
 
@@ -27,6 +29,11 @@ func extractResource(g *model.Graph, logicalID string, res RawResource) {
 
 	case "AWS::Serverless::HttpApi":
 		g.APIs[logicalID] = extractSAMHttpApi(logicalID, res.Properties)
+
+	case "AWS::ApiGatewayV2::Integration":
+		if lambdaRef := extractLambdaFromIntegrationURI(res.Properties["IntegrationUri"]); lambdaRef != "" {
+			g.HTTPIntegrations[logicalID] = lambdaRef
+		}
 
 	// --- Step Functions ---
 	case "AWS::StepFunctions::StateMachine":
@@ -58,7 +65,6 @@ func extractResource(g *model.Graph, logicalID string, res RawResource) {
 		"AWS::ApiGateway::Deployment",
 		"AWS::ApiGateway::Stage",
 		"AWS::ApiGatewayV2::Route",
-		"AWS::ApiGatewayV2::Integration",
 		"AWS::ApiGatewayV2::Stage",
 		"AWS::SNS::Subscription",
 		"AWS::Lambda::Permission",
@@ -158,16 +164,45 @@ func extractStepFunction(logicalID string, props map[string]interface{}) *model.
 		Pattern:   model.SFNUnknown,
 	}
 
-	// The Definition can be inline (map) or a string. DefinitionString is also valid.
+	// The Definition can be inline (map, SAM style) or DefinitionString (raw CFN
+	// style — a JSON string, typically wrapped in Fn::Sub so ${Ref} placeholders
+	// can be substituted at deploy time).
 	if def, ok := props["Definition"].(map[string]interface{}); ok {
 		sf.DefinitionRaw = def
 		sf.StateCount, sf.Pattern, sf.TaskTargets = analyzeASL(def)
-	} else if defStr, ok := props["DefinitionString"].(string); ok {
-		// Try to parse the string as JSON into a map.
-		_ = defStr // will be used in WBS 2 for pattern classification
+	} else if defStr := definitionStringValue(props["DefinitionString"]); defStr != "" {
+		var def map[string]interface{}
+		if err := json.Unmarshal([]byte(defStr), &def); err == nil {
+			sf.DefinitionRaw = def
+			sf.StateCount, sf.Pattern, sf.TaskTargets = analyzeASL(def)
+		}
 	}
 
 	return sf
+}
+
+// definitionStringValue extracts the raw ASL JSON text from a DefinitionString
+// property. It handles both a plain string and the far more common Fn::Sub-wrapped
+// form (string or 2-element array). The ${...} placeholders left inside Task
+// "Resource" strings by Fn::Sub don't affect JSON validity, so the text can be
+// parsed as-is; extractTaskTarget resolves those placeholders separately.
+func definitionStringValue(v interface{}) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case map[string]interface{}:
+		switch sub := t["Fn::Sub"].(type) {
+		case string:
+			return sub
+		case []interface{}:
+			if len(sub) > 0 {
+				if s, ok := sub[0].(string); ok {
+					return s
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // analyzeASL does a shallow parse of the ASL definition to count states,
@@ -183,8 +218,12 @@ func analyzeASL(def map[string]interface{}) (int, model.SFNPattern, []string) {
 	hasParallel := false
 	hasMap := false
 
-	for _, stateRaw := range statesRaw {
-		state, ok := stateRaw.(map[string]interface{})
+	// Iterate state names in sorted order so TaskTargets (and therefore
+	// downstream orchestrated-group membership order) is deterministic —
+	// ASL's States object has no inherent order of its own (actual execution
+	// order comes from StartAt/Next, which this shallow parse doesn't follow).
+	for _, stateName := range sortedStringKeys(statesRaw) {
+		state, ok := statesRaw[stateName].(map[string]interface{})
 		if !ok {
 			continue
 		}
@@ -238,20 +277,26 @@ func classifyPattern(hasChoice, hasParallel, hasMap bool, stateCount int) model.
 	return model.SFNUnknown
 }
 
-// extractTaskTarget attempts to resolve the Lambda logical ID from a Task state's Resource field.
+// extractTaskTarget attempts to resolve the Lambda logical ID from a Task state's
+// Resource field. In an inline (SAM) Definition, Resource is an intrinsic function
+// object ({"Fn::GetAtt": [...]} or {"Ref": ...}). In a DefinitionString parsed from
+// raw ASL JSON text, Resource is instead a plain string containing a CFN Fn::Sub
+// placeholder, e.g. "${MyFunction.Arn}" or "${MyFunction}".
 func extractTaskTarget(state map[string]interface{}) string {
 	res := state["Resource"]
 	if res == nil {
 		return ""
 	}
-	// Check for {"Fn::GetAtt": ["LogicalID", "Arn"]} pattern.
-	if m, ok := res.(map[string]interface{}); ok {
-		if getAtt, ok := m["Fn::GetAtt"].([]interface{}); ok && len(getAtt) >= 1 {
+	switch v := res.(type) {
+	case string:
+		return extractSubRef(v)
+	case map[string]interface{}:
+		if getAtt, ok := v["Fn::GetAtt"].([]interface{}); ok && len(getAtt) >= 1 {
 			if s, ok := getAtt[0].(string); ok {
 				return s
 			}
 		}
-		if ref, ok := m["Ref"].(string); ok {
+		if ref, ok := v["Ref"].(string); ok {
 			return ref
 		}
 	}
@@ -453,10 +498,21 @@ func refToString(v interface{}) string {
 		return "${" + ref + "}"
 	}
 	if ga, ok := m["Fn::GetAtt"].([]interface{}); ok && len(ga) >= 2 {
-		return "${" + ga[0].(string) + "." + ga[1].(string) + "}"
+		s0, ok0 := ga[0].(string)
+		s1, ok1 := ga[1].(string)
+		if ok0 && ok1 {
+			return "${" + s0 + "." + s1 + "}"
+		}
 	}
-	if sub, ok := m["Fn::Sub"].(string); ok {
+	switch sub := m["Fn::Sub"].(type) {
+	case string:
 		return sub
+	case []interface{}:
+		if len(sub) > 0 {
+			if s, ok := sub[0].(string); ok {
+				return s
+			}
+		}
 	}
 	return "<?>"
 }

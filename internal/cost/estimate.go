@@ -126,7 +126,8 @@ func estimateServerless(g *model.Graph, usage *UsageProfile, p *RegionalPrices) 
 	var sc ServerlessCost
 
 	// Lambda.
-	for id, fn := range g.Lambdas {
+	for _, id := range sortedKeys(g.Lambdas) {
+		fn := g.Lambdas[id]
 		u := usage.Lambdas[id]
 		if u == nil {
 			continue
@@ -137,7 +138,8 @@ func estimateServerless(g *model.Graph, usage *UsageProfile, p *RegionalPrices) 
 	}
 
 	// API Gateway.
-	for id, api := range g.APIs {
+	for _, id := range sortedKeys(g.APIs) {
+		api := g.APIs[id]
 		u := usage.APIs[id]
 		if u == nil {
 			continue
@@ -157,7 +159,8 @@ func estimateServerless(g *model.Graph, usage *UsageProfile, p *RegionalPrices) 
 	}
 
 	// Step Functions.
-	for id, sf := range g.StepFuncs {
+	for _, id := range sortedKeys(g.StepFuncs) {
+		sf := g.StepFuncs[id]
 		u := usage.StepFuncs[id]
 		if u == nil {
 			continue
@@ -174,7 +177,8 @@ func estimateServerless(g *model.Graph, usage *UsageProfile, p *RegionalPrices) 
 	}
 
 	// EventBridge rules.
-	for id, rule := range g.Rules {
+	for _, id := range sortedKeys(g.Rules) {
+		rule := g.Rules[id]
 		u := usage.Rules[id]
 		if u == nil {
 			continue
@@ -196,7 +200,8 @@ func estimateServerless(g *model.Graph, usage *UsageProfile, p *RegionalPrices) 
 	}
 
 	// SQS.
-	for id, q := range g.Queues {
+	for _, id := range sortedKeys(g.Queues) {
+		q := g.Queues[id]
 		u := usage.Queues[id]
 		if u == nil {
 			continue
@@ -216,7 +221,7 @@ func estimateServerless(g *model.Graph, usage *UsageProfile, p *RegionalPrices) 
 	}
 
 	// SNS.
-	for id := range g.Topics {
+	for _, id := range sortedKeys(g.Topics) {
 		u := usage.Topics[id]
 		if u == nil {
 			continue
@@ -231,7 +236,8 @@ func estimateServerless(g *model.Graph, usage *UsageProfile, p *RegionalPrices) 
 	}
 
 	// DynamoDB.
-	for id, table := range g.Tables {
+	for _, id := range sortedKeys(g.Tables) {
+		table := g.Tables[id]
 		u := usage.Tables[id]
 		if u == nil {
 			continue

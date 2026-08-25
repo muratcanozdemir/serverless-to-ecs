@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -53,20 +54,31 @@ func ParseFile(path string) (*model.Graph, error) {
 	g.TemplateVersion = raw.AWSTemplateFormatVersion
 	g.IsSAM = isSAMTemplate(raw.Transform)
 
+	// Iterate resources in a fixed (sorted) order rather than raw.Resources'
+	// map order, which Go randomizes per run. Edge/route creation appends to
+	// slices in iteration order, so an unsorted iteration would make the
+	// generated Terraform (service ordering, ALB listener priorities, etc.)
+	// non-reproducible between runs of the same input template.
+	logicalIDs := make([]string, 0, len(raw.Resources))
+	for logicalID := range raw.Resources {
+		logicalIDs = append(logicalIDs, logicalID)
+	}
+	sort.Strings(logicalIDs)
+
 	// First pass: extract typed resources.
-	for logicalID, res := range raw.Resources {
-		extractResource(g, logicalID, res)
+	for _, logicalID := range logicalIDs {
+		extractResource(g, logicalID, raw.Resources[logicalID])
 	}
 
 	// Second pass: resolve inter-resource references and build edges.
-	for logicalID, res := range raw.Resources {
-		resolveEdges(g, logicalID, res)
+	for _, logicalID := range logicalIDs {
+		resolveEdges(g, logicalID, raw.Resources[logicalID])
 	}
 
 	// Third pass: SAM inline events (these define edges implicitly).
 	if g.IsSAM {
-		for logicalID, res := range raw.Resources {
-			extractSAMEvents(g, logicalID, res)
+		for _, logicalID := range logicalIDs {
+			extractSAMEvents(g, logicalID, raw.Resources[logicalID])
 		}
 	}
 

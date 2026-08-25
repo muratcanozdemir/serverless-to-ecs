@@ -1,6 +1,7 @@
 package cost
 
 import (
+	"sort"
 	"strings"
 
 	"serverless-to-ecs/internal/model"
@@ -27,7 +28,8 @@ func GroupServices(g *model.Graph) []ServiceGroup {
 	var groups []ServiceGroup
 
 	// 1. API-backed services.
-	for apiID, api := range g.APIs {
+	for _, apiID := range sortedKeys(g.APIs) {
+		api := g.APIs[apiID]
 		var members []string
 		for _, route := range g.Routes {
 			if route.APIID == apiID && !assigned[route.TargetRef] {
@@ -71,7 +73,7 @@ func GroupServices(g *model.Graph) []ServiceGroup {
 	}
 
 	// 2. Queue processors: Lambdas triggered by SQS.
-	for queueID := range g.Queues {
+	for _, queueID := range sortedKeys(g.Queues) {
 		var members []string
 		for _, edge := range g.Edges {
 			if edge.From == queueID && edge.Type == model.EdgeTriggers && !assigned[edge.To] {
@@ -92,7 +94,7 @@ func GroupServices(g *model.Graph) []ServiceGroup {
 	}
 
 	// SNS-triggered Lambdas.
-	for topicID := range g.Topics {
+	for _, topicID := range sortedKeys(g.Topics) {
 		var members []string
 		for _, edge := range g.Edges {
 			if edge.From == topicID && edge.Type == model.EdgeTriggers && !assigned[edge.To] {
@@ -114,7 +116,7 @@ func GroupServices(g *model.Graph) []ServiceGroup {
 
 	// 3. Scheduled: Lambdas triggered by EventBridge rules.
 	var scheduledMembers []string
-	for ruleID := range g.Rules {
+	for _, ruleID := range sortedKeys(g.Rules) {
 		for _, edge := range g.Edges {
 			if edge.From == ruleID && edge.Type == model.EdgeTriggers && !assigned[edge.To] {
 				if _, ok := g.Lambdas[edge.To]; ok {
@@ -143,7 +145,8 @@ func GroupServices(g *model.Graph) []ServiceGroup {
 	}
 
 	// 4. Orchestrated: Lambdas called by Step Functions (not already assigned).
-	for sfnID, sf := range g.StepFuncs {
+	for _, sfnID := range sortedKeys(g.StepFuncs) {
+		sf := g.StepFuncs[sfnID]
 		var members []string
 		for _, target := range sf.TaskTargets {
 			if !assigned[target] {
@@ -169,14 +172,15 @@ func GroupServices(g *model.Graph) []ServiceGroup {
 
 	// 5. Remaining: group by naming prefix.
 	var unassigned []string
-	for id := range g.Lambdas {
+	for _, id := range sortedKeys(g.Lambdas) {
 		if !assigned[id] {
 			unassigned = append(unassigned, id)
 		}
 	}
 	if len(unassigned) > 0 {
 		prefixGroups := groupByPrefix(unassigned)
-		for prefix, members := range prefixGroups {
+		for _, prefix := range sortedKeys(prefixGroups) {
+			members := prefixGroups[prefix]
 			groups = append(groups, ServiceGroup{
 				Name:      sanitizeName(prefix) + "-svc",
 				Type:      "standalone",
@@ -231,6 +235,19 @@ func sanitizeName(s string) string {
 		".", "-",
 	).Replace(s)
 	return s
+}
+
+// sortedKeys returns a map's keys in sorted order, so callers get a
+// deterministic iteration order instead of Go's randomized map order —
+// load-bearing here since iteration order determines the order of generated
+// service groups (and downstream, ALB listener priorities and file layout).
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func dedup(items []string) []string {
