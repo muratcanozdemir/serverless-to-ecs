@@ -1,0 +1,12 @@
+# Compiled binary (built via `go build -o serverless-to-ecs .`)
+/serverless-to-ecs
+
+# Generated migration output (Terraform stubs, reports)
+/output/
+
+# Go build/test artifacts
+*.test
+*.out
+
+# Editor/OS cruft
+.DS_Store
