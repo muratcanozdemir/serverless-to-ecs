@@ -9,12 +9,12 @@ import (
 
 // Estimate holds the full cost breakdown: current serverless vs. projected ECS.
 type Estimate struct {
-	Region   string
-	Accuracy string // e.g. "±30% (heuristic defaults)" or "±15% (sidecar data)"
+	Region   string `json:"region"`
+	Accuracy string `json:"accuracy"` // e.g. "±30% (heuristic defaults)" or "±15% (sidecar data)"
 
-	Serverless ServerlessCost
-	ECS        ECSCost
-	Savings    SavingsSummary
+	Serverless ServerlessCost `json:"serverless"`
+	ECS        ECSCost        `json:"ecs"`
+	Savings    SavingsSummary `json:"savings"`
 }
 
 // ServerlessCost is the itemized current monthly spend.

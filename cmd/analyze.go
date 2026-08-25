@@ -26,20 +26,26 @@ func sortedKeys[V any](m map[string]V) []string {
 	return keys
 }
 
-// Run is the CLI entrypoint. Returns exit code.
-func Run() int {
-	templatePath := flag.String("template", "", "Path to CFN/SAM template (JSON or YAML)")
-	region := flag.String("region", "eu-central-1", "AWS region for pricing")
-	usagePath := flag.String("usage", "", "Path to usage profile sidecar JSON (optional)")
-	outputDir := flag.String("output", "output", "Directory for generated artifacts")
-	llmEndpoint := flag.String("llm-endpoint", "", "OpenAI-compatible API base URL (e.g. http://localhost:8080/v1)")
-	llmModel := flag.String("llm-model", "", "Model name for LLM report generation")
-	jsonDump := flag.Bool("json", false, "Dump the full analysis as JSON and exit")
-	flag.Parse()
+// Run is the CLI entrypoint. Takes args (typically os.Args[1:]) rather than
+// reading the global flag.CommandLine, so it can be invoked more than once
+// in-process (e.g. from tests) without "flag redefined" panics, and a bad
+// flag returns an error code instead of calling os.Exit directly.
+func Run(args []string) int {
+	fs := flag.NewFlagSet("serverless-to-ecs", flag.ContinueOnError)
+	templatePath := fs.String("template", "", "Path to CFN/SAM template (JSON or YAML)")
+	region := fs.String("region", "eu-central-1", "AWS region for pricing")
+	usagePath := fs.String("usage", "", "Path to usage profile sidecar JSON (optional)")
+	outputDir := fs.String("output", "output", "Directory for generated artifacts")
+	llmEndpoint := fs.String("llm-endpoint", "", "OpenAI-compatible API base URL (e.g. http://localhost:8080/v1)")
+	llmModel := fs.String("llm-model", "", "Model name for LLM report generation")
+	jsonDump := fs.Bool("json", false, "Dump the full analysis as JSON and exit")
+	if err := fs.Parse(args); err != nil {
+		return 1
+	}
 
 	if *templatePath == "" {
 		fmt.Fprintln(os.Stderr, "error: -template is required")
-		flag.Usage()
+		fs.Usage()
 		return 1
 	}
 

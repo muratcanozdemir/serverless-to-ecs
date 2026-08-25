@@ -353,8 +353,8 @@ func writeFallback(ctx *Context, outPath string) error {
 	// Inventory.
 	b.WriteString("## Resource Inventory\n\n")
 	b.WriteString("| Resource Type | Count |\n|---|---|\n")
-	for k, v := range ctx.Stack.Counts {
-		b.WriteString(fmt.Sprintf("| %s | %d |\n", k, v))
+	for _, k := range sortedKeys(ctx.Stack.Counts) {
+		b.WriteString(fmt.Sprintf("| %s | %d |\n", k, ctx.Stack.Counts[k]))
 	}
 	b.WriteString("\n")
 
