@@ -1,10 +1,26 @@
 package parser
 
 import (
+	"sort"
 	"strings"
 
 	"serverless-to-ecs/internal/model"
 )
+
+// sortedStringKeys returns a map's keys in sorted order. Several CFN
+// properties (SAM Events, env var Variables) are unordered JSON objects, but
+// the order in which they're processed here determines the order of edges
+// added to the graph — and downstream, the order of generated Terraform
+// resources — so iterating in Go's randomized map order would make output
+// non-reproducible between runs of the same template.
+func sortedStringKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
 
 // resolveEdges examines a resource's properties for references to other resources
 // and creates typed edges in the graph. Called once per resource in the second pass.
@@ -28,16 +44,25 @@ func resolveEdges(g *model.Graph, logicalID string, res RawResource) {
 
 	case "AWS::SNS::Subscription":
 		resolveSNSSubscription(g, res.Properties)
+
+	case "AWS::S3::Bucket":
+		resolveS3BucketNotifications(g, logicalID, res.Properties)
 	}
 
-	// For any Lambda, check env vars for table references.
+	// For any Lambda, check env vars for table/secret references and EFS mounts.
 	if res.Type == "AWS::Lambda::Function" || res.Type == "AWS::Serverless::Function" {
 		resolveLambdaEnvRefs(g, logicalID, res.Properties)
+		resolveLambdaEFSRefs(g, logicalID)
 	}
 }
 
 // resolveEventSourceMapping handles AWS::Lambda::EventSourceMapping.
 // These wire SQS queues (or DynamoDB streams, Kinesis) to Lambda functions.
+//
+// Known limitation: only Ref/Fn::GetAtt forms of FunctionName/EventSourceArn are
+// resolved. A literal ARN string or an Fn::ImportValue (common when the queue or
+// function is defined in a different stack) has no logical ID in this template's
+// graph to link to, so the trigger edge is silently skipped rather than guessed at.
 func resolveEventSourceMapping(g *model.Graph, _ string, props map[string]interface{}) {
 	fnRef := resolveRef(props["FunctionName"])
 	sourceRef := resolveRef(props["EventSourceArn"])
@@ -51,9 +76,36 @@ func resolveEventSourceMapping(g *model.Graph, _ string, props map[string]interf
 		g.AddEdge(sourceRef, fnRef, model.EdgeTriggers, "SQS event source")
 	} else if _, ok := g.Tables[sourceRef]; ok {
 		g.AddEdge(sourceRef, fnRef, model.EdgeTriggers, "DynamoDB stream")
+	} else if _, ok := g.Streams[sourceRef]; ok {
+		g.AddEdge(sourceRef, fnRef, model.EdgeTriggers, "Kinesis stream")
 	} else {
-		// Could be Kinesis or another source we don't model.
+		// Some other source we don't model.
 		g.AddEdge(sourceRef, fnRef, model.EdgeTriggers, "event source mapping")
+	}
+}
+
+// resolveS3BucketNotifications handles native (non-SAM) S3 → Lambda event
+// notifications configured directly on the bucket's NotificationConfiguration.
+func resolveS3BucketNotifications(g *model.Graph, bucketID string, props map[string]interface{}) {
+	notif, ok := props["NotificationConfiguration"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	configs, ok := notif["LambdaConfigurations"].([]interface{})
+	if !ok {
+		return
+	}
+	for _, c := range configs {
+		cm, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		fnRef := resolveRef(cm["Function"])
+		if fnRef == "" {
+			continue
+		}
+		event := getString(cm, "Event")
+		g.AddEdge(bucketID, fnRef, model.EdgeTriggers, "S3 notification: "+event)
 	}
 }
 
@@ -97,27 +149,55 @@ func resolveAPIGatewayMethod(g *model.Graph, _ string, props map[string]interfac
 	g.AddEdge(apiRef, lambdaRef, model.EdgeInvokes, method+" "+path)
 }
 
-// resolveHTTPAPIRoute handles HTTP API (v2) routes.
+// resolveHTTPAPIRoute handles HTTP API (v2) routes. A Route's Target property
+// references an AWS::ApiGatewayV2::Integration (typically
+// Fn::Sub: "integrations/${MyIntegration}"), not a Lambda directly, so it's
+// resolved via g.HTTPIntegrations (populated during extraction from each
+// Integration's IntegrationUri) to find the actual Lambda target.
 func resolveHTTPAPIRoute(g *model.Graph, _ string, props map[string]interface{}) {
 	apiRef := resolveRef(props["ApiId"])
 	routeKey := getString(props, "RouteKey") // e.g., "GET /items"
 
-	targetRef := resolveRef(props["Target"])
-	if targetRef == "" {
+	integrationID := extractIntegrationID(props["Target"])
+	if integrationID == "" {
+		return
+	}
+	lambdaRef, ok := g.HTTPIntegrations[integrationID]
+	if !ok || lambdaRef == "" {
 		return
 	}
 
-	// Target is usually an integration, not a Lambda directly.
-	// For the graph, we record the route. Edge resolution for HTTP APIs
-	// is less reliable than REST APIs without also reading the Integration resource.
 	if apiRef != "" && routeKey != "" {
 		g.Routes = append(g.Routes, model.APIRoute{
 			APIID:     apiRef,
 			Path:      routeKey,
 			Method:    "",
-			TargetRef: targetRef,
+			TargetRef: lambdaRef,
 		})
 	}
+	g.AddEdge(apiRef, lambdaRef, model.EdgeInvokes, routeKey)
+}
+
+// extractIntegrationID pulls the Integration logical ID out of a Route's Target
+// property, which is a literal "integrations/{id}" string or (far more commonly)
+// an Fn::Sub of the same shape, e.g. Fn::Sub: "integrations/${MyIntegration}".
+func extractIntegrationID(target interface{}) string {
+	switch v := target.(type) {
+	case string:
+		return strings.TrimPrefix(v, "integrations/")
+	case map[string]interface{}:
+		switch sub := v["Fn::Sub"].(type) {
+		case string:
+			return extractSubRef(sub)
+		case []interface{}:
+			if len(sub) > 0 {
+				if s, ok := sub[0].(string); ok {
+					return extractSubRef(s)
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // resolveEventBridgeTargets creates edges from EventBridge rules to their targets.
@@ -165,7 +245,10 @@ func resolveSNSSubscription(g *model.Graph, props map[string]interface{}) {
 }
 
 // resolveLambdaEnvRefs scans a Lambda's environment variables for references
-// to DynamoDB tables, SQS queues, etc.
+// to DynamoDB tables, SQS queues, SNS topics, Secrets Manager secrets, and
+// SSM parameters. When an env var resolves to a secret/parameter, it's also
+// recorded on the Lambda's SecretRefs so the emitter can route it into ECS's
+// native "secrets" container field instead of "environment".
 func resolveLambdaEnvRefs(g *model.Graph, logicalID string, props map[string]interface{}) {
 	env, ok := props["Environment"].(map[string]interface{})
 	if !ok {
@@ -175,9 +258,10 @@ func resolveLambdaEnvRefs(g *model.Graph, logicalID string, props map[string]int
 	if !ok {
 		return
 	}
+	fn := g.Lambdas[logicalID]
 
-	for _, v := range vars {
-		ref := resolveRef(v)
+	for _, k := range sortedStringKeys(vars) {
+		ref := resolveRef(vars[k])
 		if ref == "" {
 			continue
 		}
@@ -187,7 +271,40 @@ func resolveLambdaEnvRefs(g *model.Graph, logicalID string, props map[string]int
 			g.AddEdge(logicalID, ref, model.EdgePublishes, "env var reference")
 		} else if _, ok := g.Topics[ref]; ok {
 			g.AddEdge(logicalID, ref, model.EdgePublishes, "env var reference")
+		} else if _, ok := g.Secrets[ref]; ok {
+			g.AddEdge(logicalID, ref, model.EdgeReadsSecret, "env var reference")
+			setSecretRef(fn, k, "secretsmanager", ref)
+		} else if _, ok := g.Parameters[ref]; ok {
+			g.AddEdge(logicalID, ref, model.EdgeReadsSecret, "env var reference")
+			setSecretRef(fn, k, "ssm", ref)
 		}
+	}
+}
+
+// setSecretRef records that a Lambda's env var key resolves to a Secrets
+// Manager secret or SSM parameter defined elsewhere in this template.
+func setSecretRef(fn *model.Lambda, key, kind, logicalID string) {
+	if fn == nil {
+		return
+	}
+	if fn.SecretRefs == nil {
+		fn.SecretRefs = make(map[string]model.SecretRef)
+	}
+	fn.SecretRefs[key] = model.SecretRef{Kind: kind, LogicalID: logicalID}
+}
+
+// resolveLambdaEFSRefs creates Lambda → EFS access point edges from the
+// mounts already extracted onto the Lambda during the first pass.
+func resolveLambdaEFSRefs(g *model.Graph, logicalID string) {
+	fn, ok := g.Lambdas[logicalID]
+	if !ok {
+		return
+	}
+	for _, m := range fn.EFSMounts {
+		if m.AccessPointRef == "" {
+			continue
+		}
+		g.AddEdge(logicalID, m.AccessPointRef, model.EdgeMounts, "EFS mount: "+m.LocalMountPath)
 	}
 }
 
@@ -202,8 +319,8 @@ func extractSAMEvents(g *model.Graph, logicalID string, res RawResource) {
 		return
 	}
 
-	for eventName, eventRaw := range events {
-		event, ok := eventRaw.(map[string]interface{})
+	for _, eventName := range sortedStringKeys(events) {
+		event, ok := events[eventName].(map[string]interface{})
 		if !ok {
 			continue
 		}
@@ -256,6 +373,18 @@ func extractSAMEvents(g *model.Graph, logicalID string, res RawResource) {
 			if streamRef != "" {
 				g.AddEdge(streamRef, logicalID, model.EdgeTriggers, "SAM DynamoDB stream: "+eventName)
 			}
+
+		case "S3":
+			bucketRef := resolveRef(eventProps["Bucket"])
+			if bucketRef != "" {
+				g.AddEdge(bucketRef, logicalID, model.EdgeTriggers, "SAM S3 event: "+eventName)
+			}
+
+		case "Kinesis":
+			streamRef := resolveRef(eventProps["Stream"])
+			if streamRef != "" {
+				g.AddEdge(streamRef, logicalID, model.EdgeTriggers, "SAM Kinesis event: "+eventName)
+			}
 		}
 	}
 }
@@ -270,9 +399,18 @@ func extractLambdaFromIntegrationURI(uri interface{}) string {
 	}
 
 	// Sub expression: look for ${LogicalID} or ${LogicalID.Arn} patterns.
+	// Fn::Sub has both a plain-string form and a 2-element array form
+	// (["...${Var}...", {"Var": {...}}]) used when substituting multiple refs.
 	if m, ok := uri.(map[string]interface{}); ok {
-		if sub, ok := m["Fn::Sub"].(string); ok {
+		switch sub := m["Fn::Sub"].(type) {
+		case string:
 			return extractSubRef(sub)
+		case []interface{}:
+			if len(sub) > 0 {
+				if s, ok := sub[0].(string); ok {
+					return extractSubRef(s)
+				}
+			}
 		}
 	}
 

@@ -25,15 +25,19 @@ type PricingMeta struct {
 
 // RegionalPrices contains per-service pricing for one AWS region.
 type RegionalPrices struct {
-	Lambda        LambdaPricing        `json:"lambda"`
-	APIGateway    APIGatewayPricing    `json:"api_gateway"`
-	StepFunctions StepFunctionsPricing `json:"step_functions"`
-	EventBridge   EventBridgePricing   `json:"eventbridge"`
-	SQS           SQSPricing           `json:"sqs"`
-	SNS           SNSPricing           `json:"sns"`
-	DynamoDB      DynamoDBPricing      `json:"dynamodb"`
-	Fargate       FargatePricing       `json:"fargate"`
-	ALB           ALBPricing           `json:"alb"`
+	Lambda         LambdaPricing         `json:"lambda"`
+	APIGateway     APIGatewayPricing     `json:"api_gateway"`
+	StepFunctions  StepFunctionsPricing  `json:"step_functions"`
+	EventBridge    EventBridgePricing    `json:"eventbridge"`
+	SQS            SQSPricing            `json:"sqs"`
+	SNS            SNSPricing            `json:"sns"`
+	DynamoDB       DynamoDBPricing       `json:"dynamodb"`
+	Fargate        FargatePricing        `json:"fargate"`
+	ALB            ALBPricing            `json:"alb"`
+	S3             S3Pricing             `json:"s3"`
+	Kinesis        KinesisPricing        `json:"kinesis"`
+	EFS            EFSPricing            `json:"efs"`
+	SecretsManager SecretsManagerPricing `json:"secrets_manager"`
 }
 
 type LambdaPricing struct {
@@ -83,6 +87,30 @@ type FargatePricing struct {
 type ALBPricing struct {
 	PerHour    float64 `json:"per_hour"`
 	LCUPerHour float64 `json:"lcu_per_hour"`
+}
+
+type S3Pricing struct {
+	StandardStoragePerGBMonth float64 `json:"standard_storage_per_gb_month"`
+	PutRequestsPerThousand    float64 `json:"put_requests_per_thousand"`
+	GetRequestsPerThousand    float64 `json:"get_requests_per_thousand"`
+}
+
+type KinesisPricing struct {
+	ShardPerHour             float64 `json:"shard_per_hour"`
+	PutPayloadUnitPerMillion float64 `json:"put_payload_unit_per_million"`
+}
+
+type EFSPricing struct {
+	StandardStoragePerGBMonth float64 `json:"standard_storage_per_gb_month"`
+}
+
+// SecretsManagerPricing covers Secrets Manager only — SSM Standard
+// parameters are free, so there's no cost line item for AWS::SSM::Parameter
+// (SSM Advanced parameters and the Parameter Store API-call-based pricing
+// tier aren't modeled; this tool tracks Standard parameters).
+type SecretsManagerPricing struct {
+	PerSecretPerMonth      float64 `json:"per_secret_per_month"`
+	APICallsPerTenThousand float64 `json:"api_calls_per_ten_thousand"`
 }
 
 // LoadPricing loads the embedded pricing database.

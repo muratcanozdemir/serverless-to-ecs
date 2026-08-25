@@ -240,12 +240,22 @@ Resources:
           Projection:
             ProjectionType: ALL
 
-  # ─── Supporting Resources (not modeled, but should be detected) ───
+  # ─── S3 ────────────────────────────────────────────────────
 
   OrderAssetsBucket:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: ecommerce-order-assets
+
+  # ─── Supporting Resources (not modeled, but should be detected) ───
+
+  OrderCache:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      ClusterName: ecommerce-order-cache
+      Engine: redis
+      CacheNodeType: cache.t3.micro
+      NumCacheNodes: 1
 
   CreateOrderFnLogGroup:
     Type: AWS::Logs::LogGroup

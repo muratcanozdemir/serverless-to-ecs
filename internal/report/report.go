@@ -8,12 +8,26 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"serverless-to-ecs/internal/cost"
 	"serverless-to-ecs/internal/model"
 )
+
+// sortedKeys returns a map's keys in sorted order, so the resource lists
+// built below have a deterministic order instead of Go's randomized map
+// order — otherwise the report (and the LLM prompt built from it) would
+// list the same stack's resources in a different order on every run.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
 
 // Options configures the report generator.
 type Options struct {
@@ -25,22 +39,27 @@ type Options struct {
 
 // Context is the structured data payload sent to the LLM.
 type Context struct {
-	Stack       StackOverview          `json:"stack"`
-	Lambdas     []LambdaDetail         `json:"lambdas"`
-	APIs        []APIDetail            `json:"apis"`
-	StepFuncs   []StepFuncDetail       `json:"step_functions"`
-	Rules       []RuleDetail           `json:"eventbridge_rules"`
-	Queues      []QueueDetail          `json:"sqs_queues"`
-	Tables      []TableDetail          `json:"dynamodb_tables"`
-	Cost        *cost.Estimate         `json:"cost_estimate"`
-	Groups      []cost.ServiceGroup    `json:"service_groups"`
+	Stack       StackOverview               `json:"stack"`
+	Lambdas     []LambdaDetail              `json:"lambdas"`
+	APIs        []APIDetail                 `json:"apis"`
+	StepFuncs   []StepFuncDetail            `json:"step_functions"`
+	Rules       []RuleDetail                `json:"eventbridge_rules"`
+	Queues      []QueueDetail               `json:"sqs_queues"`
+	Tables      []TableDetail               `json:"dynamodb_tables"`
+	Buckets     []BucketDetail              `json:"s3_buckets"`
+	Streams     []StreamDetail              `json:"kinesis_streams"`
+	FileSystems []FileSystemDetail          `json:"efs_filesystems"`
+	Secrets     []SecretDetail              `json:"secrets"`
+	Parameters  []ParameterDetail           `json:"ssm_parameters"`
+	Cost        *cost.Estimate              `json:"cost_estimate"`
+	Groups      []cost.ServiceGroup         `json:"service_groups"`
 	Unsupported []model.UnsupportedResource `json:"unsupported_resources"`
 }
 
 type StackOverview struct {
-	Description string `json:"description"`
-	IsSAM       bool   `json:"is_sam"`
-	Region      string `json:"region"`
+	Description string         `json:"description"`
+	IsSAM       bool           `json:"is_sam"`
+	Region      string         `json:"region"`
 	Counts      map[string]int `json:"resource_counts"`
 }
 
@@ -54,9 +73,9 @@ type LambdaDetail struct {
 }
 
 type APIDetail struct {
-	LogicalID string `json:"logical_id"`
-	Name      string `json:"name"`
-	Protocol  string `json:"protocol"`
+	LogicalID string        `json:"logical_id"`
+	Name      string        `json:"name"`
+	Protocol  string        `json:"protocol"`
 	Routes    []RouteDetail `json:"routes"`
 }
 
@@ -76,9 +95,9 @@ type StepFuncDetail struct {
 }
 
 type RuleDetail struct {
-	LogicalID string `json:"logical_id"`
-	Name      string `json:"name"`
-	Schedule  string `json:"schedule"`
+	LogicalID string   `json:"logical_id"`
+	Name      string   `json:"name"`
+	Schedule  string   `json:"schedule"`
 	Targets   []string `json:"targets"`
 }
 
@@ -95,6 +114,32 @@ type TableDetail struct {
 	HashKey     string `json:"hash_key"`
 	RangeKey    string `json:"range_key,omitempty"`
 	GSICount    int    `json:"gsi_count"`
+}
+
+type BucketDetail struct {
+	LogicalID  string `json:"logical_id"`
+	BucketName string `json:"bucket_name"`
+}
+
+type StreamDetail struct {
+	LogicalID  string `json:"logical_id"`
+	StreamName string `json:"stream_name"`
+	ShardCount int    `json:"shard_count"`
+}
+
+type FileSystemDetail struct {
+	LogicalID string `json:"logical_id"`
+}
+
+type SecretDetail struct {
+	LogicalID string `json:"logical_id"`
+	Name      string `json:"name"`
+}
+
+type ParameterDetail struct {
+	LogicalID string `json:"logical_id"`
+	Name      string `json:"name"`
+	Type      string `json:"type"`
 }
 
 // Generate produces the migration report. Tries LLM if endpoint is configured,
@@ -135,6 +180,11 @@ func buildContext(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup
 				"queues":      len(g.Queues),
 				"topics":      len(g.Topics),
 				"tables":      len(g.Tables),
+				"buckets":     len(g.Buckets),
+				"streams":     len(g.Streams),
+				"filesystems": len(g.FileSystems),
+				"secrets":     len(g.Secrets),
+				"parameters":  len(g.Parameters),
 				"unsupported": len(g.Unsupported),
 			},
 		},
@@ -143,7 +193,8 @@ func buildContext(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup
 		Unsupported: g.Unsupported,
 	}
 
-	for _, fn := range g.Lambdas {
+	for _, id := range sortedKeys(g.Lambdas) {
+		fn := g.Lambdas[id]
 		ctx.Lambdas = append(ctx.Lambdas, LambdaDetail{
 			LogicalID:    fn.LogicalID,
 			FunctionName: fn.FunctionName,
@@ -154,7 +205,8 @@ func buildContext(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup
 		})
 	}
 
-	for apiID, api := range g.APIs {
+	for _, apiID := range sortedKeys(g.APIs) {
+		api := g.APIs[apiID]
 		ad := APIDetail{
 			LogicalID: apiID,
 			Name:      api.Name,
@@ -172,7 +224,8 @@ func buildContext(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup
 		ctx.APIs = append(ctx.APIs, ad)
 	}
 
-	for _, sf := range g.StepFuncs {
+	for _, id := range sortedKeys(g.StepFuncs) {
+		sf := g.StepFuncs[id]
 		ctx.StepFuncs = append(ctx.StepFuncs, StepFuncDetail{
 			LogicalID:   sf.LogicalID,
 			Name:        sf.Name,
@@ -183,7 +236,8 @@ func buildContext(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup
 		})
 	}
 
-	for _, rule := range g.Rules {
+	for _, id := range sortedKeys(g.Rules) {
+		rule := g.Rules[id]
 		ctx.Rules = append(ctx.Rules, RuleDetail{
 			LogicalID: rule.LogicalID,
 			Name:      rule.Name,
@@ -192,7 +246,8 @@ func buildContext(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup
 		})
 	}
 
-	for _, q := range g.Queues {
+	for _, id := range sortedKeys(g.Queues) {
+		q := g.Queues[id]
 		ctx.Queues = append(ctx.Queues, QueueDetail{
 			LogicalID: q.LogicalID,
 			QueueName: q.QueueName,
@@ -200,7 +255,8 @@ func buildContext(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup
 		})
 	}
 
-	for _, t := range g.Tables {
+	for _, id := range sortedKeys(g.Tables) {
+		t := g.Tables[id]
 		ctx.Tables = append(ctx.Tables, TableDetail{
 			LogicalID:   t.LogicalID,
 			TableName:   t.TableName,
@@ -208,6 +264,47 @@ func buildContext(g *model.Graph, est *cost.Estimate, groups []cost.ServiceGroup
 			HashKey:     t.HashKey,
 			RangeKey:    t.RangeKey,
 			GSICount:    t.GSICount,
+		})
+	}
+
+	for _, id := range sortedKeys(g.Buckets) {
+		b := g.Buckets[id]
+		ctx.Buckets = append(ctx.Buckets, BucketDetail{
+			LogicalID:  b.LogicalID,
+			BucketName: b.BucketName,
+		})
+	}
+
+	for _, id := range sortedKeys(g.Streams) {
+		s := g.Streams[id]
+		ctx.Streams = append(ctx.Streams, StreamDetail{
+			LogicalID:  s.LogicalID,
+			StreamName: s.StreamName,
+			ShardCount: s.ShardCount,
+		})
+	}
+
+	for _, id := range sortedKeys(g.FileSystems) {
+		fs := g.FileSystems[id]
+		ctx.FileSystems = append(ctx.FileSystems, FileSystemDetail{
+			LogicalID: fs.LogicalID,
+		})
+	}
+
+	for _, id := range sortedKeys(g.Secrets) {
+		s := g.Secrets[id]
+		ctx.Secrets = append(ctx.Secrets, SecretDetail{
+			LogicalID: s.LogicalID,
+			Name:      s.Name,
+		})
+	}
+
+	for _, id := range sortedKeys(g.Parameters) {
+		p := g.Parameters[id]
+		ctx.Parameters = append(ctx.Parameters, ParameterDetail{
+			LogicalID: p.LogicalID,
+			Name:      p.Name,
+			Type:      p.Type,
 		})
 	}
 
@@ -333,8 +430,8 @@ func writeFallback(ctx *Context, outPath string) error {
 	// Inventory.
 	b.WriteString("## Resource Inventory\n\n")
 	b.WriteString("| Resource Type | Count |\n|---|---|\n")
-	for k, v := range ctx.Stack.Counts {
-		b.WriteString(fmt.Sprintf("| %s | %d |\n", k, v))
+	for _, k := range sortedKeys(ctx.Stack.Counts) {
+		b.WriteString(fmt.Sprintf("| %s | %d |\n", k, ctx.Stack.Counts[k]))
 	}
 	b.WriteString("\n")
 
@@ -345,6 +442,47 @@ func writeFallback(ctx *Context, outPath string) error {
 		for _, fn := range ctx.Lambdas {
 			b.WriteString(fmt.Sprintf("| %s | %s | %d MB | %d s |\n",
 				fn.FunctionName, fn.Runtime, fn.MemoryMB, fn.TimeoutSec))
+		}
+		b.WriteString("\n")
+	}
+
+	// S3 buckets.
+	if len(ctx.Buckets) > 0 {
+		b.WriteString("## S3 Buckets\n\n")
+		b.WriteString("| Bucket |\n|---|\n")
+		for _, bucket := range ctx.Buckets {
+			b.WriteString(fmt.Sprintf("| %s |\n", bucket.BucketName))
+		}
+		b.WriteString("\n")
+	}
+
+	// Kinesis streams.
+	if len(ctx.Streams) > 0 {
+		b.WriteString("## Kinesis Streams\n\n")
+		b.WriteString("| Stream | Shards |\n|---|---|\n")
+		for _, s := range ctx.Streams {
+			b.WriteString(fmt.Sprintf("| %s | %d |\n", s.StreamName, s.ShardCount))
+		}
+		b.WriteString("\n")
+	}
+
+	// EFS file systems.
+	if len(ctx.FileSystems) > 0 {
+		b.WriteString("## EFS File Systems\n\n")
+		for _, fs := range ctx.FileSystems {
+			b.WriteString(fmt.Sprintf("- %s\n", fs.LogicalID))
+		}
+		b.WriteString("\n")
+	}
+
+	// Secrets and parameters.
+	if len(ctx.Secrets) > 0 || len(ctx.Parameters) > 0 {
+		b.WriteString("## Secrets Manager / SSM Parameter Store\n\n")
+		for _, s := range ctx.Secrets {
+			b.WriteString(fmt.Sprintf("- %s (Secrets Manager)\n", s.Name))
+		}
+		for _, p := range ctx.Parameters {
+			b.WriteString(fmt.Sprintf("- %s (SSM %s)\n", p.Name, p.Type))
 		}
 		b.WriteString("\n")
 	}
@@ -385,6 +523,10 @@ func writeFallback(ctx *Context, outPath string) error {
 		{"EventBridge", ctx.Cost.Serverless.EventBridge},
 		{"SQS", ctx.Cost.Serverless.SQS},
 		{"DynamoDB", ctx.Cost.Serverless.DynamoDB},
+		{"S3", ctx.Cost.Serverless.S3},
+		{"Kinesis", ctx.Cost.Serverless.Kinesis},
+		{"EFS", ctx.Cost.Serverless.EFS},
+		{"Secrets Manager / SSM", ctx.Cost.Serverless.SecretsManager},
 	} {
 		if len(label.items) > 0 {
 			b.WriteString(fmt.Sprintf("**%s:**\n\n", label.name))
@@ -406,7 +548,7 @@ func writeFallback(ctx *Context, outPath string) error {
 		b.WriteString("\n")
 	}
 	b.WriteString(fmt.Sprintf("- ALB: $%.2f\n", ctx.Cost.ECS.ALB))
-	b.WriteString(fmt.Sprintf("- Retained (DynamoDB, SQS, SNS): $%.2f\n", ctx.Cost.ECS.Retained))
+	b.WriteString(fmt.Sprintf("- Retained (DynamoDB, SQS, SNS, S3, Kinesis, EFS, Secrets Manager/SSM): $%.2f\n", ctx.Cost.ECS.Retained))
 	b.WriteString(fmt.Sprintf("\n**Total ECS: $%.2f/month**\n\n", ctx.Cost.ECS.Total))
 
 	delta := ctx.Cost.Savings.DeltaAbsolute
@@ -445,6 +587,8 @@ func writeFallback(ctx *Context, outPath string) error {
 	b.WriteString("- `alb.tf` — Application Load Balancer, strangler routing\n")
 	b.WriteString("- `scheduled.tf` — ECS scheduled tasks (replaces EventBridge→Lambda)\n")
 	b.WriteString("- `sqs_pollers.tf` — Queue consumer documentation\n")
+	b.WriteString("- `kinesis_consumers.tf` — Kinesis stream consumer documentation\n")
+	b.WriteString("- `s3_event_processors.tf` — S3 event processor documentation\n")
 	b.WriteString("- `outputs.tf` — ALB DNS, cluster ARN\n")
 
 	return os.WriteFile(outPath, []byte(b.String()), 0644)

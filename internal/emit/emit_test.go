@@ -1,6 +1,7 @@
 package emit
 
 import (
+	"flag"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -12,16 +13,11 @@ import (
 	"serverless-to-ecs/internal/parser"
 )
 
-var update = false
-
-func init() {
-	// Check for -update flag in test args.
-	for _, arg := range os.Args {
-		if arg == "-update" || arg == "--update" {
-			update = true
-		}
-	}
-}
+// update regenerates golden files instead of comparing against them. Must be
+// registered via the flag package (not a manual os.Args scan) so that
+// testing.Main's own flag.Parse recognizes it — an unregistered flag causes
+// the test binary to exit before any test runs.
+var update = flag.Bool("update", false, "update golden files")
 
 func repoRoot() string {
 	_, file, _, _ := runtime.Caller(0)
@@ -53,10 +49,12 @@ func TestEmitTerraform_GoldenFiles(t *testing.T) {
 		"alb.tf",
 		"scheduled.tf",
 		"sqs_pollers.tf",
+		"kinesis_consumers.tf",
+		"s3_event_processors.tf",
 		"outputs.tf",
 	}
 
-	if update {
+	if *update {
 		// Write golden files.
 		if err := os.MkdirAll(goldenDir, 0755); err != nil {
 			t.Fatalf("create golden dir: %v", err)
@@ -89,12 +87,12 @@ func TestEmitTerraform_GoldenFiles(t *testing.T) {
 
 			golden, err := os.ReadFile(filepath.Join(goldenDir, name))
 			if err != nil {
-				t.Fatalf("read golden (run 'go test ./internal/emit/ -args -update' to generate): %v", err)
+				t.Fatalf("read golden (run 'go test ./internal/emit -run TestEmitTerraform_GoldenFiles -update' to generate): %v", err)
 			}
 
 			if string(generated) != string(golden) {
 				t.Errorf("%s does not match golden file.\n"+
-					"Run 'go test ./internal/emit/ -args -update' to regenerate.\n"+
+					"Run 'go test ./internal/emit -run TestEmitTerraform_GoldenFiles -update' to regenerate.\n"+
 					"Diff (first divergence):\n%s",
 					name, firstDiff(string(golden), string(generated)))
 			}
@@ -114,7 +112,8 @@ func TestEmitTerraform_AllFilesCreated(t *testing.T) {
 
 	expected := []string{
 		"main.tf", "variables.tf", "ecs.tf", "alb.tf",
-		"scheduled.tf", "sqs_pollers.tf", "outputs.tf",
+		"scheduled.tf", "sqs_pollers.tf", "kinesis_consumers.tf",
+		"s3_event_processors.tf", "outputs.tf",
 	}
 	for _, name := range expected {
 		path := filepath.Join(tmpDir, name)

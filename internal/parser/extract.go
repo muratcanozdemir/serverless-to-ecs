@@ -1,6 +1,9 @@
 package parser
 
 import (
+	"encoding/json"
+	"regexp"
+
 	"serverless-to-ecs/internal/model"
 )
 
@@ -28,6 +31,11 @@ func extractResource(g *model.Graph, logicalID string, res RawResource) {
 	case "AWS::Serverless::HttpApi":
 		g.APIs[logicalID] = extractSAMHttpApi(logicalID, res.Properties)
 
+	case "AWS::ApiGatewayV2::Integration":
+		if lambdaRef := extractLambdaFromIntegrationURI(res.Properties["IntegrationUri"]); lambdaRef != "" {
+			g.HTTPIntegrations[logicalID] = lambdaRef
+		}
+
 	// --- Step Functions ---
 	case "AWS::StepFunctions::StateMachine":
 		g.StepFuncs[logicalID] = extractStepFunction(logicalID, res.Properties)
@@ -51,6 +59,28 @@ func extractResource(g *model.Graph, logicalID string, res RawResource) {
 	case "AWS::DynamoDB::Table":
 		g.Tables[logicalID] = extractDynamoDBTable(logicalID, res.Properties)
 
+	// --- S3 ---
+	case "AWS::S3::Bucket":
+		g.Buckets[logicalID] = extractS3Bucket(logicalID, res.Properties)
+
+	// --- Kinesis ---
+	case "AWS::Kinesis::Stream":
+		g.Streams[logicalID] = extractKinesisStream(logicalID, res.Properties)
+
+	// --- EFS ---
+	case "AWS::EFS::FileSystem":
+		g.FileSystems[logicalID] = &model.EFSFileSystem{LogicalID: logicalID}
+
+	case "AWS::EFS::AccessPoint":
+		g.AccessPoints[logicalID] = extractEFSAccessPoint(logicalID, res.Properties)
+
+	// --- Secrets Manager / SSM Parameter Store ---
+	case "AWS::SecretsManager::Secret":
+		g.Secrets[logicalID] = extractSecret(logicalID, res.Properties)
+
+	case "AWS::SSM::Parameter":
+		g.Parameters[logicalID] = extractSSMParameter(logicalID, res.Properties)
+
 	// --- Resources we detect but don't model ---
 	case "AWS::Lambda::EventSourceMapping",
 		"AWS::ApiGateway::Method",
@@ -58,13 +88,15 @@ func extractResource(g *model.Graph, logicalID string, res RawResource) {
 		"AWS::ApiGateway::Deployment",
 		"AWS::ApiGateway::Stage",
 		"AWS::ApiGatewayV2::Route",
-		"AWS::ApiGatewayV2::Integration",
 		"AWS::ApiGatewayV2::Stage",
 		"AWS::SNS::Subscription",
 		"AWS::Lambda::Permission",
 		"AWS::IAM::Role",
 		"AWS::IAM::Policy",
-		"AWS::Logs::LogGroup":
+		"AWS::Logs::LogGroup",
+		"AWS::EFS::MountTarget",
+		"AWS::SecretsManager::SecretTargetAttachment",
+		"AWS::S3::BucketPolicy":
 		// These are wiring/permission resources. We use them for edge detection
 		// (in edges.go) but don't model them as top-level inventory items.
 		return
@@ -80,6 +112,7 @@ func extractResource(g *model.Graph, logicalID string, res RawResource) {
 // --- Lambda extractors ---
 
 func extractLambda(logicalID string, props map[string]interface{}) *model.Lambda {
+	envVars := getEnvVars(props)
 	return &model.Lambda{
 		LogicalID:    logicalID,
 		FunctionName: getString(props, "FunctionName"),
@@ -87,11 +120,15 @@ func extractLambda(logicalID string, props map[string]interface{}) *model.Lambda
 		Handler:      getString(props, "Handler"),
 		MemoryMB:     getInt(props, "MemorySize", 128),
 		TimeoutSec:   getInt(props, "Timeout", 3),
-		EnvVars:      getEnvVars(props),
+		EnvVars:      envVars,
+		VPCConfig:    extractVPCConfig(props),
+		EFSMounts:    extractEFSMounts(props),
+		SecretRefs:   detectDynamicSecretRefs(envVars),
 	}
 }
 
 func extractSAMLambda(logicalID string, props map[string]interface{}) *model.Lambda {
+	envVars := getEnvVars(props)
 	l := &model.Lambda{
 		LogicalID:    logicalID,
 		FunctionName: getString(props, "FunctionName"),
@@ -100,13 +137,106 @@ func extractSAMLambda(logicalID string, props map[string]interface{}) *model.Lam
 		MemoryMB:     getInt(props, "MemorySize", 128),
 		TimeoutSec:   getInt(props, "Timeout", 3),
 		CodeURI:      getString(props, "CodeUri"),
-		EnvVars:      getEnvVars(props),
+		EnvVars:      envVars,
+		VPCConfig:    extractVPCConfig(props),
+		EFSMounts:    extractEFSMounts(props),
+		SecretRefs:   detectDynamicSecretRefs(envVars),
 	}
 	// SAM functions with no explicit FunctionName get the logical ID.
 	if l.FunctionName == "" {
 		l.FunctionName = logicalID
 	}
 	return l
+}
+
+// extractVPCConfig records that a Lambda runs inside a VPC. Subnet/security
+// group IDs are usually Ref/Fn::ImportValue/parameter references that can't
+// be resolved to concrete values without deploying the stack, so these are
+// kept as human-readable strings for the migration report, not as
+// something the emitter can wire into Terraform automatically.
+func extractVPCConfig(props map[string]interface{}) *model.VPCConfig {
+	vpc, ok := props["VpcConfig"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	subnets := stringRefs(vpc["SubnetIds"])
+	sgs := stringRefs(vpc["SecurityGroupIds"])
+	if len(subnets) == 0 && len(sgs) == 0 {
+		return nil
+	}
+	return &model.VPCConfig{SubnetRefs: subnets, SecurityGroupRefs: sgs}
+}
+
+// stringRefs converts a CFN list value (literal strings and/or
+// Ref/Fn::GetAtt/Fn::Sub intrinsics) into human-readable strings.
+func stringRefs(v interface{}) []string {
+	arr, ok := v.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, item := range arr {
+		if s, ok := item.(string); ok {
+			out = append(out, s)
+			continue
+		}
+		out = append(out, refToString(item))
+	}
+	return out
+}
+
+// extractEFSMounts reads a Lambda's FileSystemConfigs (Lambda → EFS access
+// point mounts).
+func extractEFSMounts(props map[string]interface{}) []model.EFSMount {
+	configs, ok := props["FileSystemConfigs"].([]interface{})
+	if !ok {
+		return nil
+	}
+	var mounts []model.EFSMount
+	for _, c := range configs {
+		cm, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		mounts = append(mounts, model.EFSMount{
+			AccessPointRef: resolveRef(cm["Arn"]),
+			LocalMountPath: getString(cm, "LocalMountPath"),
+		})
+	}
+	return mounts
+}
+
+// dynamicRefRegex matches CloudFormation's dynamic reference syntax for
+// Secrets Manager and SSM Parameter Store, e.g.
+// "{{resolve:secretsmanager:my-secret:SecretString:password}}" or
+// "{{resolve:ssm:/my/parameter}}". Unlike Ref/Fn::GetAtt, CFN resolves these
+// server-side from a literal string embedded directly in the property value
+// (they work even when the secret/parameter isn't a resource in this
+// template at all), so they're detected independently of Ref resolution.
+var dynamicRefRegex = regexp.MustCompile(`\{\{resolve:(secretsmanager|ssm-secure|ssm):[^}]+\}\}`)
+
+// detectDynamicSecretRefs scans already-resolved env var values for the CFN
+// dynamic reference syntax. Ref/Fn::GetAtt-based references to a
+// AWS::SecretsManager::Secret or AWS::SSM::Parameter resource in this
+// template are detected separately, in resolveLambdaEnvRefs (edges.go),
+// since that requires cross-referencing other extracted resources.
+func detectDynamicSecretRefs(envVars map[string]string) map[string]model.SecretRef {
+	var refs map[string]model.SecretRef
+	for k, v := range envVars {
+		m := dynamicRefRegex.FindStringSubmatch(v)
+		if m == nil {
+			continue
+		}
+		kind := "ssm"
+		if m[1] == "secretsmanager" {
+			kind = "secretsmanager"
+		}
+		if refs == nil {
+			refs = make(map[string]model.SecretRef)
+		}
+		refs[k] = model.SecretRef{Kind: kind, RawRef: v}
+	}
+	return refs
 }
 
 // --- API Gateway extractors ---
@@ -158,16 +288,45 @@ func extractStepFunction(logicalID string, props map[string]interface{}) *model.
 		Pattern:   model.SFNUnknown,
 	}
 
-	// The Definition can be inline (map) or a string. DefinitionString is also valid.
+	// The Definition can be inline (map, SAM style) or DefinitionString (raw CFN
+	// style — a JSON string, typically wrapped in Fn::Sub so ${Ref} placeholders
+	// can be substituted at deploy time).
 	if def, ok := props["Definition"].(map[string]interface{}); ok {
 		sf.DefinitionRaw = def
 		sf.StateCount, sf.Pattern, sf.TaskTargets = analyzeASL(def)
-	} else if defStr, ok := props["DefinitionString"].(string); ok {
-		// Try to parse the string as JSON into a map.
-		_ = defStr // will be used in WBS 2 for pattern classification
+	} else if defStr := definitionStringValue(props["DefinitionString"]); defStr != "" {
+		var def map[string]interface{}
+		if err := json.Unmarshal([]byte(defStr), &def); err == nil {
+			sf.DefinitionRaw = def
+			sf.StateCount, sf.Pattern, sf.TaskTargets = analyzeASL(def)
+		}
 	}
 
 	return sf
+}
+
+// definitionStringValue extracts the raw ASL JSON text from a DefinitionString
+// property. It handles both a plain string and the far more common Fn::Sub-wrapped
+// form (string or 2-element array). The ${...} placeholders left inside Task
+// "Resource" strings by Fn::Sub don't affect JSON validity, so the text can be
+// parsed as-is; extractTaskTarget resolves those placeholders separately.
+func definitionStringValue(v interface{}) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case map[string]interface{}:
+		switch sub := t["Fn::Sub"].(type) {
+		case string:
+			return sub
+		case []interface{}:
+			if len(sub) > 0 {
+				if s, ok := sub[0].(string); ok {
+					return s
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // analyzeASL does a shallow parse of the ASL definition to count states,
@@ -183,8 +342,12 @@ func analyzeASL(def map[string]interface{}) (int, model.SFNPattern, []string) {
 	hasParallel := false
 	hasMap := false
 
-	for _, stateRaw := range statesRaw {
-		state, ok := stateRaw.(map[string]interface{})
+	// Iterate state names in sorted order so TaskTargets (and therefore
+	// downstream orchestrated-group membership order) is deterministic —
+	// ASL's States object has no inherent order of its own (actual execution
+	// order comes from StartAt/Next, which this shallow parse doesn't follow).
+	for _, stateName := range sortedStringKeys(statesRaw) {
+		state, ok := statesRaw[stateName].(map[string]interface{})
 		if !ok {
 			continue
 		}
@@ -238,20 +401,26 @@ func classifyPattern(hasChoice, hasParallel, hasMap bool, stateCount int) model.
 	return model.SFNUnknown
 }
 
-// extractTaskTarget attempts to resolve the Lambda logical ID from a Task state's Resource field.
+// extractTaskTarget attempts to resolve the Lambda logical ID from a Task state's
+// Resource field. In an inline (SAM) Definition, Resource is an intrinsic function
+// object ({"Fn::GetAtt": [...]} or {"Ref": ...}). In a DefinitionString parsed from
+// raw ASL JSON text, Resource is instead a plain string containing a CFN Fn::Sub
+// placeholder, e.g. "${MyFunction.Arn}" or "${MyFunction}".
 func extractTaskTarget(state map[string]interface{}) string {
 	res := state["Resource"]
 	if res == nil {
 		return ""
 	}
-	// Check for {"Fn::GetAtt": ["LogicalID", "Arn"]} pattern.
-	if m, ok := res.(map[string]interface{}); ok {
-		if getAtt, ok := m["Fn::GetAtt"].([]interface{}); ok && len(getAtt) >= 1 {
+	switch v := res.(type) {
+	case string:
+		return extractSubRef(v)
+	case map[string]interface{}:
+		if getAtt, ok := v["Fn::GetAtt"].([]interface{}); ok && len(getAtt) >= 1 {
 			if s, ok := getAtt[0].(string); ok {
 				return s
 			}
 		}
-		if ref, ok := m["Ref"].(string); ok {
+		if ref, ok := v["Ref"].(string); ok {
 			return ref
 		}
 	}
@@ -366,6 +535,56 @@ func extractSAMSimpleTable(logicalID string, props map[string]interface{}) *mode
 	return t
 }
 
+// --- S3 ---
+
+func extractS3Bucket(logicalID string, props map[string]interface{}) *model.S3Bucket {
+	return &model.S3Bucket{
+		LogicalID:  logicalID,
+		BucketName: getString(props, "BucketName"),
+	}
+}
+
+// --- Kinesis ---
+
+func extractKinesisStream(logicalID string, props map[string]interface{}) *model.KinesisStream {
+	return &model.KinesisStream{
+		LogicalID:  logicalID,
+		StreamName: getString(props, "Name"),
+		ShardCount: getInt(props, "ShardCount", 1),
+	}
+}
+
+// --- EFS ---
+
+func extractEFSAccessPoint(logicalID string, props map[string]interface{}) *model.EFSAccessPoint {
+	return &model.EFSAccessPoint{
+		LogicalID:     logicalID,
+		FileSystemRef: resolveRef(props["FileSystemId"]),
+	}
+}
+
+// --- Secrets Manager / SSM Parameter Store ---
+
+func extractSecret(logicalID string, props map[string]interface{}) *model.SecretsManagerSecret {
+	name := getString(props, "Name")
+	if name == "" {
+		name = logicalID
+	}
+	return &model.SecretsManagerSecret{LogicalID: logicalID, Name: name}
+}
+
+func extractSSMParameter(logicalID string, props map[string]interface{}) *model.SSMParameter {
+	name := getString(props, "Name")
+	if name == "" {
+		name = logicalID
+	}
+	typ := getString(props, "Type")
+	if typ == "" {
+		typ = "String"
+	}
+	return &model.SSMParameter{LogicalID: logicalID, Name: name, Type: typ}
+}
+
 // --- Property accessors ---
 
 func getString(m map[string]interface{}, key string) string {
@@ -453,10 +672,21 @@ func refToString(v interface{}) string {
 		return "${" + ref + "}"
 	}
 	if ga, ok := m["Fn::GetAtt"].([]interface{}); ok && len(ga) >= 2 {
-		return "${" + ga[0].(string) + "." + ga[1].(string) + "}"
+		s0, ok0 := ga[0].(string)
+		s1, ok1 := ga[1].(string)
+		if ok0 && ok1 {
+			return "${" + s0 + "." + s1 + "}"
+		}
 	}
-	if sub, ok := m["Fn::Sub"].(string); ok {
+	switch sub := m["Fn::Sub"].(type) {
+	case string:
 		return sub
+	case []interface{}:
+		if len(sub) > 0 {
+			if s, ok := sub[0].(string); ok {
+				return s
+			}
+		}
 	}
 	return "<?>"
 }

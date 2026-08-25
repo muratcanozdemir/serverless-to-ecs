@@ -56,6 +56,22 @@
       "alb": {
         "per_hour": 0.0252,
         "lcu_per_hour": 0.008
+      },
+      "s3": {
+        "standard_storage_per_gb_month": 0.0245,
+        "put_requests_per_thousand": 0.0054,
+        "get_requests_per_thousand": 0.00043
+      },
+      "kinesis": {
+        "shard_per_hour": 0.0189,
+        "put_payload_unit_per_million": 0.0165
+      },
+      "efs": {
+        "standard_storage_per_gb_month": 0.33
+      },
+      "secrets_manager": {
+        "per_secret_per_month": 0.40,
+        "api_calls_per_ten_thousand": 0.05
       }
     },
     "us-east-1": {
@@ -98,6 +114,22 @@
       "alb": {
         "per_hour": 0.0225,
         "lcu_per_hour": 0.008
+      },
+      "s3": {
+        "standard_storage_per_gb_month": 0.023,
+        "put_requests_per_thousand": 0.005,
+        "get_requests_per_thousand": 0.0004
+      },
+      "kinesis": {
+        "shard_per_hour": 0.015,
+        "put_payload_unit_per_million": 0.014
+      },
+      "efs": {
+        "standard_storage_per_gb_month": 0.30
+      },
+      "secrets_manager": {
+        "per_secret_per_month": 0.40,
+        "api_calls_per_ten_thousand": 0.05
       }
     }
   }

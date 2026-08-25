@@ -29,6 +29,20 @@ resource "aws_ecs_task_definition" "{{ tfident .Name }}" {
   memory                   = {{ .Memory }}
   execution_role_arn       = aws_iam_role.ecs_execution.arn
   task_role_arn            = aws_iam_role.ecs_task.arn
+{{- range .EFSMounts }}
+
+  volume {
+    name = "{{ .VolumeName }}"
+    efs_volume_configuration {
+      file_system_id     = var.{{ .FileSystemVar }}
+      transit_encryption = "ENABLED"
+      authorization_config {
+        access_point_id = var.{{ .AccessPointVar }}
+        iam             = "ENABLED"
+      }
+    }
+  }
+{{- end }}
 
   container_definitions = jsonencode([{
     name  = "{{ .Name }}"
@@ -41,7 +55,17 @@ resource "aws_ecs_task_definition" "{{ tfident .Name }}" {
 
     environment = [
 {{- range .EnvVars }}
-      { name = "{{ .Key }}", value = "{{ .Value }}" },
+      { name = {{ .KeyQuoted }}, value = {{ .ValueQuoted }} },
+{{- end }}
+    ]
+    secrets = [
+{{- range .Secrets }}
+      { name = {{ .KeyQuoted }}, valueFrom = var.{{ .VarName }} },
+{{- end }}
+    ]
+    mountPoints = [
+{{- range .EFSMounts }}
+      { sourceVolume = "{{ .VolumeName }}", containerPath = "{{ .ContainerPath }}" },
 {{- end }}
     ]
 
@@ -64,6 +88,18 @@ resource "aws_ecs_service" "{{ tfident .Name }}" {
   task_definition = aws_ecs_task_definition.{{ tfident .Name }}.arn
   desired_count   = var.{{ tfident .Name }}_desired_count
   launch_type     = "FARGATE"
+{{- if .EFSMounts }}
+
+  # EFS volumes require platform version 1.4.0 or later.
+  platform_version = "1.4.0"
+{{- end }}
+{{- if .VPCNote }}
+
+  # Source Lambda(s) ran inside a VPC — verify the subnets/security groups
+  # below provide equivalent network connectivity (e.g. reaching an RDS
+  # instance or another internal service). Original Lambda VPC config:
+  # {{ .VPCNote }}
+{{- end }}
 
   network_configuration {
     subnets         = var.subnet_ids

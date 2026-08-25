@@ -1,6 +1,7 @@
 package cost
 
 import (
+	"sort"
 	"strings"
 
 	"serverless-to-ecs/internal/model"
@@ -27,7 +28,8 @@ func GroupServices(g *model.Graph) []ServiceGroup {
 	var groups []ServiceGroup
 
 	// 1. API-backed services.
-	for apiID, api := range g.APIs {
+	for _, apiID := range sortedKeys(g.APIs) {
+		api := g.APIs[apiID]
 		var members []string
 		for _, route := range g.Routes {
 			if route.APIID == apiID && !assigned[route.TargetRef] {
@@ -71,17 +73,8 @@ func GroupServices(g *model.Graph) []ServiceGroup {
 	}
 
 	// 2. Queue processors: Lambdas triggered by SQS.
-	for queueID := range g.Queues {
-		var members []string
-		for _, edge := range g.Edges {
-			if edge.From == queueID && edge.Type == model.EdgeTriggers && !assigned[edge.To] {
-				if _, ok := g.Lambdas[edge.To]; ok {
-					members = append(members, edge.To)
-					assigned[edge.To] = true
-				}
-			}
-		}
-		if len(members) > 0 {
+	for _, queueID := range sortedKeys(g.Queues) {
+		if members := triggeredMembers(g, queueID, assigned); len(members) > 0 {
 			groups = append(groups, ServiceGroup{
 				Name:      sanitizeName(queueID) + "-processor",
 				Type:      "queue-processor",
@@ -92,17 +85,8 @@ func GroupServices(g *model.Graph) []ServiceGroup {
 	}
 
 	// SNS-triggered Lambdas.
-	for topicID := range g.Topics {
-		var members []string
-		for _, edge := range g.Edges {
-			if edge.From == topicID && edge.Type == model.EdgeTriggers && !assigned[edge.To] {
-				if _, ok := g.Lambdas[edge.To]; ok {
-					members = append(members, edge.To)
-					assigned[edge.To] = true
-				}
-			}
-		}
-		if len(members) > 0 {
+	for _, topicID := range sortedKeys(g.Topics) {
+		if members := triggeredMembers(g, topicID, assigned); len(members) > 0 {
 			groups = append(groups, ServiceGroup{
 				Name:      sanitizeName(topicID) + "-subscriber",
 				Type:      "queue-processor",
@@ -112,9 +96,35 @@ func GroupServices(g *model.Graph) []ServiceGroup {
 		}
 	}
 
+	// Kinesis-triggered Lambdas. Grouped the same way as SQS: a stream
+	// consumer is architecturally the same shape as a queue processor — a
+	// long-running container polling/consuming a stream of events.
+	for _, streamID := range sortedKeys(g.Streams) {
+		if members := triggeredMembers(g, streamID, assigned); len(members) > 0 {
+			groups = append(groups, ServiceGroup{
+				Name:      sanitizeName(streamID) + "-consumer",
+				Type:      "queue-processor",
+				LambdaIDs: dedup(members),
+				Reason:    "Kinesis trigger: " + streamID,
+			})
+		}
+	}
+
+	// S3-triggered Lambdas.
+	for _, bucketID := range sortedKeys(g.Buckets) {
+		if members := triggeredMembers(g, bucketID, assigned); len(members) > 0 {
+			groups = append(groups, ServiceGroup{
+				Name:      sanitizeName(bucketID) + "-processor",
+				Type:      "queue-processor",
+				LambdaIDs: dedup(members),
+				Reason:    "S3 event trigger: " + bucketID,
+			})
+		}
+	}
+
 	// 3. Scheduled: Lambdas triggered by EventBridge rules.
 	var scheduledMembers []string
-	for ruleID := range g.Rules {
+	for _, ruleID := range sortedKeys(g.Rules) {
 		for _, edge := range g.Edges {
 			if edge.From == ruleID && edge.Type == model.EdgeTriggers && !assigned[edge.To] {
 				if _, ok := g.Lambdas[edge.To]; ok {
@@ -143,7 +153,8 @@ func GroupServices(g *model.Graph) []ServiceGroup {
 	}
 
 	// 4. Orchestrated: Lambdas called by Step Functions (not already assigned).
-	for sfnID, sf := range g.StepFuncs {
+	for _, sfnID := range sortedKeys(g.StepFuncs) {
+		sf := g.StepFuncs[sfnID]
 		var members []string
 		for _, target := range sf.TaskTargets {
 			if !assigned[target] {
@@ -169,14 +180,15 @@ func GroupServices(g *model.Graph) []ServiceGroup {
 
 	// 5. Remaining: group by naming prefix.
 	var unassigned []string
-	for id := range g.Lambdas {
+	for _, id := range sortedKeys(g.Lambdas) {
 		if !assigned[id] {
 			unassigned = append(unassigned, id)
 		}
 	}
 	if len(unassigned) > 0 {
 		prefixGroups := groupByPrefix(unassigned)
-		for prefix, members := range prefixGroups {
+		for _, prefix := range sortedKeys(prefixGroups) {
+			members := prefixGroups[prefix]
 			groups = append(groups, ServiceGroup{
 				Name:      sanitizeName(prefix) + "-svc",
 				Type:      "standalone",
@@ -231,6 +243,35 @@ func sanitizeName(s string) string {
 		".", "-",
 	).Replace(s)
 	return s
+}
+
+// triggeredMembers finds Lambdas triggered by sourceID (via an EdgeTriggers
+// edge) that haven't already been assigned to a group, marking each as
+// assigned as it's found.
+func triggeredMembers(g *model.Graph, sourceID string, assigned map[string]bool) []string {
+	var members []string
+	for _, edge := range g.Edges {
+		if edge.From == sourceID && edge.Type == model.EdgeTriggers && !assigned[edge.To] {
+			if _, ok := g.Lambdas[edge.To]; ok {
+				members = append(members, edge.To)
+				assigned[edge.To] = true
+			}
+		}
+	}
+	return members
+}
+
+// sortedKeys returns a map's keys in sorted order, so callers get a
+// deterministic iteration order instead of Go's randomized map order —
+// load-bearing here since iteration order determines the order of generated
+// service groups (and downstream, ALB listener priorities and file layout).
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func dedup(items []string) []string {
