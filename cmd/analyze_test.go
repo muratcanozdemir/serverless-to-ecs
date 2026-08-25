@@ -39,6 +39,23 @@ func captureStdout(t *testing.T, fn func()) string {
 	return buf.String()
 }
 
+func TestRun_Version(t *testing.T) {
+	old := Version
+	Version = "v1.2.3-test"
+	defer func() { Version = old }()
+
+	var code int
+	out := captureStdout(t, func() {
+		code = Run([]string{"-version"})
+	})
+	if code != 0 {
+		t.Fatalf("Run -version = %d, want 0", code)
+	}
+	if !strings.Contains(out, "v1.2.3-test") {
+		t.Errorf("expected stamped version in output, got %q", out)
+	}
+}
+
 func TestRun_MissingTemplateFlag(t *testing.T) {
 	code := Run(nil)
 	if code != 1 {

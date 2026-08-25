@@ -26,6 +26,13 @@ func sortedKeys[V any](m map[string]V) []string {
 	return keys
 }
 
+// Version is stamped at build time via:
+//
+//	go build -ldflags "-X serverless-to-ecs/cmd.Version=v1.2.3"
+//
+// and left at its default for local/dev builds (`go build .`, `go run .`).
+var Version = "dev"
+
 // Run is the CLI entrypoint. Takes args (typically os.Args[1:]) rather than
 // reading the global flag.CommandLine, so it can be invoked more than once
 // in-process (e.g. from tests) without "flag redefined" panics, and a bad
@@ -39,8 +46,14 @@ func Run(args []string) int {
 	llmEndpoint := fs.String("llm-endpoint", "", "OpenAI-compatible API base URL (e.g. http://localhost:8080/v1)")
 	llmModel := fs.String("llm-model", "", "Model name for LLM report generation")
 	jsonDump := fs.Bool("json", false, "Dump the full analysis as JSON and exit")
+	showVersion := fs.Bool("version", false, "Print version and exit")
 	if err := fs.Parse(args); err != nil {
 		return 1
+	}
+
+	if *showVersion {
+		fmt.Println("serverless-to-ecs " + Version)
+		return 0
 	}
 
 	if *templatePath == "" {

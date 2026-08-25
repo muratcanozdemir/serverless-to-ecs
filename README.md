@@ -1,5 +1,7 @@
 # serverless-to-ecs
 
+[![CI](https://github.com/muratcanozdemir/serverless-to-ecs/actions/workflows/ci.yml/badge.svg)](https://github.com/muratcanozdemir/serverless-to-ecs/actions/workflows/ci.yml)
+
 Reads an AWS serverless stack (CloudFormation / CDK / SAM templates), estimates
 costs, and proposes a migration to ECS Fargate — complete with Terraform stubs
 in a strangler deployment pattern and a migration report.
@@ -23,6 +25,19 @@ in a strangler deployment pattern and a migration report.
 go mod tidy
 go build -o serverless-to-ecs .
 ```
+
+To stamp a version (shown by `-version`), set it via `-ldflags` at build time —
+this is what the release workflow does for tagged builds:
+
+```
+go build -ldflags "-X serverless-to-ecs/cmd.Version=v1.2.3" -o serverless-to-ecs .
+```
+
+### Releases
+
+Pushing a tag matching `v*` (e.g. `v1.2.3`) triggers the release workflow,
+which cross-compiles binaries for linux/darwin (amd64/arm64) and
+windows/amd64, and publishes them to a GitHub Release with `sha256` checksums.
 
 ## Usage
 
@@ -57,6 +72,7 @@ go build -o serverless-to-ecs .
 | `-llm-endpoint` | | OpenAI-compatible API base URL |
 | `-llm-model` | | Model name for report generation |
 | `-json` | `false` | Dump cost estimate as JSON and exit |
+| `-version` | `false` | Print version and exit |
 
 ### Output structure
 
