@@ -175,18 +175,27 @@ func TestParseSyntheticStack(t *testing.T) {
 		t.Error("missing edge: CreateOrderFn → OrderTable (reads_writes)")
 	}
 
-	// Unsupported resources should be detected.
-	if len(g.Unsupported) == 0 {
-		t.Error("expected unsupported resources (e.g. S3 bucket)")
+	// S3.
+	bucket, ok := g.Buckets["OrderAssetsBucket"]
+	if !ok {
+		t.Fatal("missing Bucket: OrderAssetsBucket")
 	}
-	foundS3 := false
+	if bucket.BucketName != "ecommerce-order-assets" {
+		t.Errorf("OrderAssetsBucket name: got %q", bucket.BucketName)
+	}
+
+	// Unsupported resources should still be detected (e.g. ElastiCache).
+	if len(g.Unsupported) == 0 {
+		t.Error("expected unsupported resources (e.g. ElastiCache cluster)")
+	}
+	foundCache := false
 	for _, u := range g.Unsupported {
-		if u.ResourceType == "AWS::S3::Bucket" {
-			foundS3 = true
+		if u.ResourceType == "AWS::ElastiCache::CacheCluster" {
+			foundCache = true
 		}
 	}
-	if !foundS3 {
-		t.Error("expected AWS::S3::Bucket in unsupported resources")
+	if !foundCache {
+		t.Error("expected AWS::ElastiCache::CacheCluster in unsupported resources")
 	}
 
 	t.Logf("Graph summary: %s", g.Summary())

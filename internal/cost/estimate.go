@@ -19,14 +19,14 @@ type Estimate struct {
 
 // ServerlessCost is the itemized current monthly spend.
 type ServerlessCost struct {
-	Lambda        []LambdaCost  `json:"lambda"`
-	APIGateway    []ItemCost    `json:"api_gateway"`
-	StepFunctions []ItemCost    `json:"step_functions"`
-	EventBridge   []ItemCost    `json:"eventbridge"`
-	SQS           []ItemCost    `json:"sqs"`
-	SNS           []ItemCost    `json:"sns"`
-	DynamoDB      []ItemCost    `json:"dynamodb"`
-	Total         float64       `json:"total"`
+	Lambda        []LambdaCost `json:"lambda"`
+	APIGateway    []ItemCost   `json:"api_gateway"`
+	StepFunctions []ItemCost   `json:"step_functions"`
+	EventBridge   []ItemCost   `json:"eventbridge"`
+	SQS           []ItemCost   `json:"sqs"`
+	SNS           []ItemCost   `json:"sns"`
+	DynamoDB      []ItemCost   `json:"dynamodb"`
+	Total         float64      `json:"total"`
 }
 
 // LambdaCost is the cost breakdown for one Lambda function.

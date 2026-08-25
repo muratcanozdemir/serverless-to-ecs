@@ -17,12 +17,12 @@ import (
 // JSON equivalents ({"Ref": ...}, {"Fn::GetAtt": ...}) so downstream code
 // only handles one representation.
 type RawTemplate struct {
-	AWSTemplateFormatVersion string                    `json:"AWSTemplateFormatVersion" yaml:"AWSTemplateFormatVersion"`
-	Transform                interface{}               `json:"Transform" yaml:"Transform"`
-	Description              string                    `json:"Description" yaml:"Description"`
-	Globals                  map[string]interface{}     `json:"Globals" yaml:"Globals"`
-	Resources                map[string]RawResource    `json:"Resources" yaml:"Resources"`
-	Outputs                  map[string]interface{}    `json:"Outputs" yaml:"Outputs"`
+	AWSTemplateFormatVersion string                 `json:"AWSTemplateFormatVersion" yaml:"AWSTemplateFormatVersion"`
+	Transform                interface{}            `json:"Transform" yaml:"Transform"`
+	Description              string                 `json:"Description" yaml:"Description"`
+	Globals                  map[string]interface{} `json:"Globals" yaml:"Globals"`
+	Resources                map[string]RawResource `json:"Resources" yaml:"Resources"`
+	Outputs                  map[string]interface{} `json:"Outputs" yaml:"Outputs"`
 }
 
 // RawResource is a single CFN resource before type-specific extraction.

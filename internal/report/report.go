@@ -39,22 +39,22 @@ type Options struct {
 
 // Context is the structured data payload sent to the LLM.
 type Context struct {
-	Stack       StackOverview          `json:"stack"`
-	Lambdas     []LambdaDetail         `json:"lambdas"`
-	APIs        []APIDetail            `json:"apis"`
-	StepFuncs   []StepFuncDetail       `json:"step_functions"`
-	Rules       []RuleDetail           `json:"eventbridge_rules"`
-	Queues      []QueueDetail          `json:"sqs_queues"`
-	Tables      []TableDetail          `json:"dynamodb_tables"`
-	Cost        *cost.Estimate         `json:"cost_estimate"`
-	Groups      []cost.ServiceGroup    `json:"service_groups"`
+	Stack       StackOverview               `json:"stack"`
+	Lambdas     []LambdaDetail              `json:"lambdas"`
+	APIs        []APIDetail                 `json:"apis"`
+	StepFuncs   []StepFuncDetail            `json:"step_functions"`
+	Rules       []RuleDetail                `json:"eventbridge_rules"`
+	Queues      []QueueDetail               `json:"sqs_queues"`
+	Tables      []TableDetail               `json:"dynamodb_tables"`
+	Cost        *cost.Estimate              `json:"cost_estimate"`
+	Groups      []cost.ServiceGroup         `json:"service_groups"`
 	Unsupported []model.UnsupportedResource `json:"unsupported_resources"`
 }
 
 type StackOverview struct {
-	Description string `json:"description"`
-	IsSAM       bool   `json:"is_sam"`
-	Region      string `json:"region"`
+	Description string         `json:"description"`
+	IsSAM       bool           `json:"is_sam"`
+	Region      string         `json:"region"`
 	Counts      map[string]int `json:"resource_counts"`
 }
 
@@ -68,9 +68,9 @@ type LambdaDetail struct {
 }
 
 type APIDetail struct {
-	LogicalID string `json:"logical_id"`
-	Name      string `json:"name"`
-	Protocol  string `json:"protocol"`
+	LogicalID string        `json:"logical_id"`
+	Name      string        `json:"name"`
+	Protocol  string        `json:"protocol"`
 	Routes    []RouteDetail `json:"routes"`
 }
 
@@ -90,9 +90,9 @@ type StepFuncDetail struct {
 }
 
 type RuleDetail struct {
-	LogicalID string `json:"logical_id"`
-	Name      string `json:"name"`
-	Schedule  string `json:"schedule"`
+	LogicalID string   `json:"logical_id"`
+	Name      string   `json:"name"`
+	Schedule  string   `json:"schedule"`
 	Targets   []string `json:"targets"`
 }
 

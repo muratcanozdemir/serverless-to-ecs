@@ -2,6 +2,7 @@ package parser
 
 import (
 	"encoding/json"
+	"regexp"
 
 	"serverless-to-ecs/internal/model"
 )
@@ -58,6 +59,28 @@ func extractResource(g *model.Graph, logicalID string, res RawResource) {
 	case "AWS::DynamoDB::Table":
 		g.Tables[logicalID] = extractDynamoDBTable(logicalID, res.Properties)
 
+	// --- S3 ---
+	case "AWS::S3::Bucket":
+		g.Buckets[logicalID] = extractS3Bucket(logicalID, res.Properties)
+
+	// --- Kinesis ---
+	case "AWS::Kinesis::Stream":
+		g.Streams[logicalID] = extractKinesisStream(logicalID, res.Properties)
+
+	// --- EFS ---
+	case "AWS::EFS::FileSystem":
+		g.FileSystems[logicalID] = &model.EFSFileSystem{LogicalID: logicalID}
+
+	case "AWS::EFS::AccessPoint":
+		g.AccessPoints[logicalID] = extractEFSAccessPoint(logicalID, res.Properties)
+
+	// --- Secrets Manager / SSM Parameter Store ---
+	case "AWS::SecretsManager::Secret":
+		g.Secrets[logicalID] = extractSecret(logicalID, res.Properties)
+
+	case "AWS::SSM::Parameter":
+		g.Parameters[logicalID] = extractSSMParameter(logicalID, res.Properties)
+
 	// --- Resources we detect but don't model ---
 	case "AWS::Lambda::EventSourceMapping",
 		"AWS::ApiGateway::Method",
@@ -70,7 +93,10 @@ func extractResource(g *model.Graph, logicalID string, res RawResource) {
 		"AWS::Lambda::Permission",
 		"AWS::IAM::Role",
 		"AWS::IAM::Policy",
-		"AWS::Logs::LogGroup":
+		"AWS::Logs::LogGroup",
+		"AWS::EFS::MountTarget",
+		"AWS::SecretsManager::SecretTargetAttachment",
+		"AWS::S3::BucketPolicy":
 		// These are wiring/permission resources. We use them for edge detection
 		// (in edges.go) but don't model them as top-level inventory items.
 		return
@@ -86,6 +112,7 @@ func extractResource(g *model.Graph, logicalID string, res RawResource) {
 // --- Lambda extractors ---
 
 func extractLambda(logicalID string, props map[string]interface{}) *model.Lambda {
+	envVars := getEnvVars(props)
 	return &model.Lambda{
 		LogicalID:    logicalID,
 		FunctionName: getString(props, "FunctionName"),
@@ -93,11 +120,15 @@ func extractLambda(logicalID string, props map[string]interface{}) *model.Lambda
 		Handler:      getString(props, "Handler"),
 		MemoryMB:     getInt(props, "MemorySize", 128),
 		TimeoutSec:   getInt(props, "Timeout", 3),
-		EnvVars:      getEnvVars(props),
+		EnvVars:      envVars,
+		VPCConfig:    extractVPCConfig(props),
+		EFSMounts:    extractEFSMounts(props),
+		SecretRefs:   detectDynamicSecretRefs(envVars),
 	}
 }
 
 func extractSAMLambda(logicalID string, props map[string]interface{}) *model.Lambda {
+	envVars := getEnvVars(props)
 	l := &model.Lambda{
 		LogicalID:    logicalID,
 		FunctionName: getString(props, "FunctionName"),
@@ -106,13 +137,106 @@ func extractSAMLambda(logicalID string, props map[string]interface{}) *model.Lam
 		MemoryMB:     getInt(props, "MemorySize", 128),
 		TimeoutSec:   getInt(props, "Timeout", 3),
 		CodeURI:      getString(props, "CodeUri"),
-		EnvVars:      getEnvVars(props),
+		EnvVars:      envVars,
+		VPCConfig:    extractVPCConfig(props),
+		EFSMounts:    extractEFSMounts(props),
+		SecretRefs:   detectDynamicSecretRefs(envVars),
 	}
 	// SAM functions with no explicit FunctionName get the logical ID.
 	if l.FunctionName == "" {
 		l.FunctionName = logicalID
 	}
 	return l
+}
+
+// extractVPCConfig records that a Lambda runs inside a VPC. Subnet/security
+// group IDs are usually Ref/Fn::ImportValue/parameter references that can't
+// be resolved to concrete values without deploying the stack, so these are
+// kept as human-readable strings for the migration report, not as
+// something the emitter can wire into Terraform automatically.
+func extractVPCConfig(props map[string]interface{}) *model.VPCConfig {
+	vpc, ok := props["VpcConfig"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	subnets := stringRefs(vpc["SubnetIds"])
+	sgs := stringRefs(vpc["SecurityGroupIds"])
+	if len(subnets) == 0 && len(sgs) == 0 {
+		return nil
+	}
+	return &model.VPCConfig{SubnetRefs: subnets, SecurityGroupRefs: sgs}
+}
+
+// stringRefs converts a CFN list value (literal strings and/or
+// Ref/Fn::GetAtt/Fn::Sub intrinsics) into human-readable strings.
+func stringRefs(v interface{}) []string {
+	arr, ok := v.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(arr))
+	for _, item := range arr {
+		if s, ok := item.(string); ok {
+			out = append(out, s)
+			continue
+		}
+		out = append(out, refToString(item))
+	}
+	return out
+}
+
+// extractEFSMounts reads a Lambda's FileSystemConfigs (Lambda → EFS access
+// point mounts).
+func extractEFSMounts(props map[string]interface{}) []model.EFSMount {
+	configs, ok := props["FileSystemConfigs"].([]interface{})
+	if !ok {
+		return nil
+	}
+	var mounts []model.EFSMount
+	for _, c := range configs {
+		cm, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		mounts = append(mounts, model.EFSMount{
+			AccessPointRef: resolveRef(cm["Arn"]),
+			LocalMountPath: getString(cm, "LocalMountPath"),
+		})
+	}
+	return mounts
+}
+
+// dynamicRefRegex matches CloudFormation's dynamic reference syntax for
+// Secrets Manager and SSM Parameter Store, e.g.
+// "{{resolve:secretsmanager:my-secret:SecretString:password}}" or
+// "{{resolve:ssm:/my/parameter}}". Unlike Ref/Fn::GetAtt, CFN resolves these
+// server-side from a literal string embedded directly in the property value
+// (they work even when the secret/parameter isn't a resource in this
+// template at all), so they're detected independently of Ref resolution.
+var dynamicRefRegex = regexp.MustCompile(`\{\{resolve:(secretsmanager|ssm-secure|ssm):[^}]+\}\}`)
+
+// detectDynamicSecretRefs scans already-resolved env var values for the CFN
+// dynamic reference syntax. Ref/Fn::GetAtt-based references to a
+// AWS::SecretsManager::Secret or AWS::SSM::Parameter resource in this
+// template are detected separately, in resolveLambdaEnvRefs (edges.go),
+// since that requires cross-referencing other extracted resources.
+func detectDynamicSecretRefs(envVars map[string]string) map[string]model.SecretRef {
+	var refs map[string]model.SecretRef
+	for k, v := range envVars {
+		m := dynamicRefRegex.FindStringSubmatch(v)
+		if m == nil {
+			continue
+		}
+		kind := "ssm"
+		if m[1] == "secretsmanager" {
+			kind = "secretsmanager"
+		}
+		if refs == nil {
+			refs = make(map[string]model.SecretRef)
+		}
+		refs[k] = model.SecretRef{Kind: kind, RawRef: v}
+	}
+	return refs
 }
 
 // --- API Gateway extractors ---
@@ -409,6 +533,56 @@ func extractSAMSimpleTable(logicalID string, props map[string]interface{}) *mode
 		t.HashKey = getString(pk, "Name")
 	}
 	return t
+}
+
+// --- S3 ---
+
+func extractS3Bucket(logicalID string, props map[string]interface{}) *model.S3Bucket {
+	return &model.S3Bucket{
+		LogicalID:  logicalID,
+		BucketName: getString(props, "BucketName"),
+	}
+}
+
+// --- Kinesis ---
+
+func extractKinesisStream(logicalID string, props map[string]interface{}) *model.KinesisStream {
+	return &model.KinesisStream{
+		LogicalID:  logicalID,
+		StreamName: getString(props, "Name"),
+		ShardCount: getInt(props, "ShardCount", 1),
+	}
+}
+
+// --- EFS ---
+
+func extractEFSAccessPoint(logicalID string, props map[string]interface{}) *model.EFSAccessPoint {
+	return &model.EFSAccessPoint{
+		LogicalID:     logicalID,
+		FileSystemRef: resolveRef(props["FileSystemId"]),
+	}
+}
+
+// --- Secrets Manager / SSM Parameter Store ---
+
+func extractSecret(logicalID string, props map[string]interface{}) *model.SecretsManagerSecret {
+	name := getString(props, "Name")
+	if name == "" {
+		name = logicalID
+	}
+	return &model.SecretsManagerSecret{LogicalID: logicalID, Name: name}
+}
+
+func extractSSMParameter(logicalID string, props map[string]interface{}) *model.SSMParameter {
+	name := getString(props, "Name")
+	if name == "" {
+		name = logicalID
+	}
+	typ := getString(props, "Type")
+	if typ == "" {
+		typ = "String"
+	}
+	return &model.SSMParameter{LogicalID: logicalID, Name: name, Type: typ}
 }
 
 // --- Property accessors ---

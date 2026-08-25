@@ -44,11 +44,15 @@ func resolveEdges(g *model.Graph, logicalID string, res RawResource) {
 
 	case "AWS::SNS::Subscription":
 		resolveSNSSubscription(g, res.Properties)
+
+	case "AWS::S3::Bucket":
+		resolveS3BucketNotifications(g, logicalID, res.Properties)
 	}
 
-	// For any Lambda, check env vars for table references.
+	// For any Lambda, check env vars for table/secret references and EFS mounts.
 	if res.Type == "AWS::Lambda::Function" || res.Type == "AWS::Serverless::Function" {
 		resolveLambdaEnvRefs(g, logicalID, res.Properties)
+		resolveLambdaEFSRefs(g, logicalID)
 	}
 }
 
@@ -72,9 +76,36 @@ func resolveEventSourceMapping(g *model.Graph, _ string, props map[string]interf
 		g.AddEdge(sourceRef, fnRef, model.EdgeTriggers, "SQS event source")
 	} else if _, ok := g.Tables[sourceRef]; ok {
 		g.AddEdge(sourceRef, fnRef, model.EdgeTriggers, "DynamoDB stream")
+	} else if _, ok := g.Streams[sourceRef]; ok {
+		g.AddEdge(sourceRef, fnRef, model.EdgeTriggers, "Kinesis stream")
 	} else {
-		// Could be Kinesis or another source we don't model.
+		// Some other source we don't model.
 		g.AddEdge(sourceRef, fnRef, model.EdgeTriggers, "event source mapping")
+	}
+}
+
+// resolveS3BucketNotifications handles native (non-SAM) S3 → Lambda event
+// notifications configured directly on the bucket's NotificationConfiguration.
+func resolveS3BucketNotifications(g *model.Graph, bucketID string, props map[string]interface{}) {
+	notif, ok := props["NotificationConfiguration"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	configs, ok := notif["LambdaConfigurations"].([]interface{})
+	if !ok {
+		return
+	}
+	for _, c := range configs {
+		cm, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		fnRef := resolveRef(cm["Function"])
+		if fnRef == "" {
+			continue
+		}
+		event := getString(cm, "Event")
+		g.AddEdge(bucketID, fnRef, model.EdgeTriggers, "S3 notification: "+event)
 	}
 }
 
@@ -214,7 +245,10 @@ func resolveSNSSubscription(g *model.Graph, props map[string]interface{}) {
 }
 
 // resolveLambdaEnvRefs scans a Lambda's environment variables for references
-// to DynamoDB tables, SQS queues, etc.
+// to DynamoDB tables, SQS queues, SNS topics, Secrets Manager secrets, and
+// SSM parameters. When an env var resolves to a secret/parameter, it's also
+// recorded on the Lambda's SecretRefs so the emitter can route it into ECS's
+// native "secrets" container field instead of "environment".
 func resolveLambdaEnvRefs(g *model.Graph, logicalID string, props map[string]interface{}) {
 	env, ok := props["Environment"].(map[string]interface{})
 	if !ok {
@@ -224,6 +258,7 @@ func resolveLambdaEnvRefs(g *model.Graph, logicalID string, props map[string]int
 	if !ok {
 		return
 	}
+	fn := g.Lambdas[logicalID]
 
 	for _, k := range sortedStringKeys(vars) {
 		ref := resolveRef(vars[k])
@@ -236,7 +271,40 @@ func resolveLambdaEnvRefs(g *model.Graph, logicalID string, props map[string]int
 			g.AddEdge(logicalID, ref, model.EdgePublishes, "env var reference")
 		} else if _, ok := g.Topics[ref]; ok {
 			g.AddEdge(logicalID, ref, model.EdgePublishes, "env var reference")
+		} else if _, ok := g.Secrets[ref]; ok {
+			g.AddEdge(logicalID, ref, model.EdgeReadsSecret, "env var reference")
+			setSecretRef(fn, k, "secretsmanager", ref)
+		} else if _, ok := g.Parameters[ref]; ok {
+			g.AddEdge(logicalID, ref, model.EdgeReadsSecret, "env var reference")
+			setSecretRef(fn, k, "ssm", ref)
 		}
+	}
+}
+
+// setSecretRef records that a Lambda's env var key resolves to a Secrets
+// Manager secret or SSM parameter defined elsewhere in this template.
+func setSecretRef(fn *model.Lambda, key, kind, logicalID string) {
+	if fn == nil {
+		return
+	}
+	if fn.SecretRefs == nil {
+		fn.SecretRefs = make(map[string]model.SecretRef)
+	}
+	fn.SecretRefs[key] = model.SecretRef{Kind: kind, LogicalID: logicalID}
+}
+
+// resolveLambdaEFSRefs creates Lambda → EFS access point edges from the
+// mounts already extracted onto the Lambda during the first pass.
+func resolveLambdaEFSRefs(g *model.Graph, logicalID string) {
+	fn, ok := g.Lambdas[logicalID]
+	if !ok {
+		return
+	}
+	for _, m := range fn.EFSMounts {
+		if m.AccessPointRef == "" {
+			continue
+		}
+		g.AddEdge(logicalID, m.AccessPointRef, model.EdgeMounts, "EFS mount: "+m.LocalMountPath)
 	}
 }
 
@@ -304,6 +372,18 @@ func extractSAMEvents(g *model.Graph, logicalID string, res RawResource) {
 			streamRef := resolveRef(eventProps["Stream"])
 			if streamRef != "" {
 				g.AddEdge(streamRef, logicalID, model.EdgeTriggers, "SAM DynamoDB stream: "+eventName)
+			}
+
+		case "S3":
+			bucketRef := resolveRef(eventProps["Bucket"])
+			if bucketRef != "" {
+				g.AddEdge(bucketRef, logicalID, model.EdgeTriggers, "SAM S3 event: "+eventName)
+			}
+
+		case "Kinesis":
+			streamRef := resolveRef(eventProps["Stream"])
+			if streamRef != "" {
+				g.AddEdge(streamRef, logicalID, model.EdgeTriggers, "SAM Kinesis event: "+eventName)
 			}
 		}
 	}

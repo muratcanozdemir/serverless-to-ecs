@@ -41,8 +41,8 @@ type ServiceData struct {
 	Type         string
 	LambdaIDs    []string
 	Reason       string
-	CPU          int    // Fargate CPU units (256, 512, 1024, 2048, 4096)
-	Memory       int    // Fargate memory in MB
+	CPU          int // Fargate CPU units (256, 512, 1024, 2048, 4096)
+	Memory       int // Fargate memory in MB
 	DesiredCount int
 	EnvVars      []EnvVar
 }

@@ -14,13 +14,13 @@ import (
 
 // UsageProfile holds estimated monthly usage for every resource in the graph.
 type UsageProfile struct {
-	Lambdas    map[string]*LambdaUsage     `json:"lambdas"`
-	APIs       map[string]*APIUsage        `json:"api_gateways"`
-	StepFuncs  map[string]*StepFuncUsage   `json:"step_functions"`
-	Rules      map[string]*EventRuleUsage  `json:"eventbridge_rules"`
-	Queues     map[string]*SQSUsage        `json:"sqs_queues"`
-	Topics     map[string]*SNSUsage        `json:"sns_topics"`
-	Tables     map[string]*DynamoDBUsage   `json:"dynamodb_tables"`
+	Lambdas   map[string]*LambdaUsage    `json:"lambdas"`
+	APIs      map[string]*APIUsage       `json:"api_gateways"`
+	StepFuncs map[string]*StepFuncUsage  `json:"step_functions"`
+	Rules     map[string]*EventRuleUsage `json:"eventbridge_rules"`
+	Queues    map[string]*SQSUsage       `json:"sqs_queues"`
+	Topics    map[string]*SNSUsage       `json:"sns_topics"`
+	Tables    map[string]*DynamoDBUsage  `json:"dynamodb_tables"`
 }
 
 type LambdaUsage struct {
@@ -35,9 +35,9 @@ type APIUsage struct {
 }
 
 type StepFuncUsage struct {
-	MonthlyExecutions      int    `json:"monthly_executions"`
-	AvgTransitionsPerExec  int    `json:"avg_transitions_per_execution"`
-	Source                 string `json:"source"`
+	MonthlyExecutions     int    `json:"monthly_executions"`
+	AvgTransitionsPerExec int    `json:"avg_transitions_per_execution"`
+	Source                string `json:"source"`
 }
 
 type EventRuleUsage struct {
