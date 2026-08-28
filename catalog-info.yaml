@@ -1,0 +1,13 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: serverless-to-ecs
+  description: Reads an AWS serverless stack (CloudFormation/CDK/SAM), estimates costs, and proposes a migration to ECS Fargate with Terraform stubs in a strangler deployment pattern.
+  tags: [go, cli, aws, migration]
+  annotations:
+    github.com/project-slug: muratcanozdemir/serverless-to-ecs
+    backstage.io/techdocs-ref: dir:.
+spec:
+  type: tool
+  owner: user:default/muratcanozdemir
+  lifecycle: experimental
