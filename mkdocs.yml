@@ -1,3 +1,5 @@
 site_name: serverless-to-ecs
 nav:
   - Home: index.md
+plugins:
+  - techdocs-core
